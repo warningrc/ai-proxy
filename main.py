@@ -295,6 +295,191 @@ async def handle_messages(request: Request):
     return JSONResponse(content=openai_to_claude_response(data))
 
 
+# ---------------------------------------------------------------------------
+#  OpenAI Chat Completions 透传接口
+# ---------------------------------------------------------------------------
+
+async def _openai_stream_passthrough(response: httpx.Response, req_id: str, t_start: float):
+    """直接透传上游 SSE 数据，仅做日志记录。"""
+    chunk_count = 0
+    try:
+        async for line in response.aiter_lines():
+            if line.startswith("data: "):
+                data_str = line[6:]
+                if data_str.strip() == "[DONE]":
+                    yield f"data: [DONE]\n\n"
+                    logger.info("[%s] openai passthrough | [DONE] | chunks=%s", req_id, chunk_count)
+                    break
+                chunk_count += 1
+                if chunk_count == 1:
+                    try:
+                        first = json.loads(data_str)
+                        logger.info(
+                            "[%s] openai passthrough | first_chunk | id=%r model=%r",
+                            req_id, first.get("id"), first.get("model"),
+                        )
+                    except json.JSONDecodeError:
+                        pass
+                yield f"data: {data_str}\n\n"
+            elif line.strip():
+                yield f"{line}\n\n"
+    finally:
+        await response.aclose()
+        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        logger.info(
+            "[%s] openai passthrough | stream_closed | chunks=%s | duration_ms=%.0f",
+            req_id, chunk_count, elapsed_ms,
+        )
+
+
+@app.post("/v1/chat/completions")
+async def handle_chat_completions(request: Request):
+    if http_client is None:
+        logger.error("Server not initialized properly")
+        raise HTTPException(status_code=500, detail="Server not initialized properly")
+
+    req_id = uuid.uuid4().hex[:12]
+    client_host = request.client.host if request.client else "?"
+    logger.info(
+        "[%s] client -> proxy | POST /v1/chat/completions | remote=%s | ua=%r",
+        req_id, client_host, request.headers.get("user-agent", "")[:200],
+    )
+
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > settings.MAX_BODY_SIZE:
+        logger.warning("[%s] reject | body too large (header) | %s bytes", req_id, content_length)
+        raise HTTPException(status_code=413, detail="Request entity too large")
+
+    try:
+        body_bytes = await request.body()
+        if len(body_bytes) > settings.MAX_BODY_SIZE:
+            logger.warning("[%s] reject | body too large | %s bytes", req_id, len(body_bytes))
+            raise HTTPException(status_code=413, detail="Request entity too large")
+        openai_req = json.loads(body_bytes)
+    except json.JSONDecodeError:
+        logger.warning("[%s] reject | invalid JSON body", req_id)
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    logger.info("[%s] proxy -> upstream | prepared | %s", req_id, summarize_openai_request(openai_req))
+    logger.debug("[%s] proxy -> upstream | openai_request_json=%s", req_id, json_preview(openai_req))
+
+    is_stream = openai_req.get("stream", False)
+
+    if is_stream:
+        built = http_client.build_request("POST", "chat/completions", json=openai_req)
+        logger.info(
+            "[%s] proxy -> upstream | POST %schat/completions | stream=true (passthrough)",
+            req_id, settings.OPENAI_API_BASE,
+        )
+        t0 = time.perf_counter()
+        try:
+            r = await http_client.send(built, stream=True)
+        except httpx.RequestError as exc:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.error(
+                "[%s] upstream | connection_failed | after_ms=%.0f | %s",
+                req_id, elapsed_ms, exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            raise HTTPException(status_code=502, detail="Upstream connection failed")
+
+        if r.status_code != 200:
+            body = await r.aread()
+            text = body.decode("utf-8", errors="replace")
+            logger.error("[%s] upstream | error | status=%s | preview=%r", req_id, r.status_code, text[:2000])
+            try:
+                err_content = json.loads(text)
+            except json.JSONDecodeError:
+                err_content = {"error": {"message": text[:500], "type": "upstream_error"}}
+            return JSONResponse(status_code=r.status_code, content=err_content)
+
+        return StreamingResponse(
+            _openai_stream_passthrough(r, req_id, t0),
+            media_type="text/event-stream",
+        )
+
+    # 非流式
+    logger.info(
+        "[%s] proxy -> upstream | POST %schat/completions | stream=false (passthrough)",
+        req_id, settings.OPENAI_API_BASE,
+    )
+    t0 = time.perf_counter()
+    try:
+        resp = await http_client.post("chat/completions", json=openai_req)
+    except httpx.RequestError as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.error(
+            "[%s] upstream | connection_failed | after_ms=%.0f | %s",
+            req_id, elapsed_ms, exc,
+            exc_info=logger.isEnabledFor(logging.DEBUG),
+        )
+        raise HTTPException(status_code=502, detail="Upstream connection failed")
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    logger.info(
+        "[%s] upstream | response | status=%s | duration_ms=%.0f",
+        req_id, resp.status_code, elapsed_ms,
+    )
+
+    if resp.status_code != 200:
+        try:
+            err_content = resp.json()
+        except Exception:
+            err_content = {"error": {"message": resp.text[:500], "type": "upstream_error"}}
+        logger.error("[%s] upstream | error | status=%s | %s", req_id, resp.status_code, json_preview(err_content))
+        return JSONResponse(status_code=resp.status_code, content=err_content)
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.error("[%s] upstream | invalid_json_body | %s | preview=%r", req_id, e, resp.text[:500])
+        raise HTTPException(status_code=502, detail="Upstream returned non-JSON body")
+
+    logger.info("[%s] upstream | ok | %s", req_id, summarize_openai_response(data))
+    return JSONResponse(content=data)
+
+
+# ---------------------------------------------------------------------------
+#  Models 列表透传接口
+# ---------------------------------------------------------------------------
+
+@app.get("/v1/models")
+async def handle_list_models(request: Request):
+    if http_client is None:
+        raise HTTPException(status_code=500, detail="Server not initialized properly")
+
+    req_id = uuid.uuid4().hex[:12]
+    logger.info("[%s] client -> proxy | GET /v1/models", req_id)
+
+    t0 = time.perf_counter()
+    try:
+        resp = await http_client.get("models")
+    except httpx.RequestError as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.error("[%s] upstream | connection_failed | after_ms=%.0f | %s", req_id, elapsed_ms, exc)
+        raise HTTPException(status_code=502, detail="Upstream connection failed")
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    logger.info("[%s] upstream | response | status=%s | duration_ms=%.0f", req_id, resp.status_code, elapsed_ms)
+
+    if resp.status_code != 200:
+        try:
+            err_content = resp.json()
+        except Exception:
+            err_content = {"error": {"message": resp.text[:500], "type": "upstream_error"}}
+        return JSONResponse(status_code=resp.status_code, content=err_content)
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        logger.error("[%s] upstream | invalid_json_body | %s", req_id, e)
+        raise HTTPException(status_code=502, detail="Upstream returned non-JSON body")
+
+    model_count = len(data.get("data", []))
+    logger.info("[%s] upstream | ok | models_count=%s", req_id, model_count)
+    return JSONResponse(content=data)
+
+
 if __name__ == "__main__":
     import uvicorn
 
