@@ -61,64 +61,79 @@ async def stream_generator(response: httpx.Response, req_id: str, t_upstream_sta
     upstream_id = None
     upstream_model = None
     parse_errors = 0
+    stream_error: str | None = None
     try:
-        async for line in response.aiter_lines():
-            if line.startswith("data: "):
-                data_str = line[6:]
-                if data_str.strip() == "[DONE]":
-                    logger.info(
-                        "[%s] upstream SSE | event=[DONE] | chunks_parsed=%s | parse_errors=%s",
-                        req_id,
-                        chunk_index,
-                        parse_errors,
-                    )
-                    break
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError as e:
-                    parse_errors += 1
-                    logger.warning(
-                        "[%s] upstream SSE | bad_json | err=%s | head=%r",
-                        req_id,
-                        e,
-                        data_str[:120],
-                    )
-                    continue
+        try:
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        logger.info(
+                            "[%s] upstream SSE | event=[DONE] | chunks_parsed=%s | parse_errors=%s",
+                            req_id,
+                            chunk_index,
+                            parse_errors,
+                        )
+                        break
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError as e:
+                        parse_errors += 1
+                        logger.warning(
+                            "[%s] upstream SSE | bad_json | err=%s | head=%r",
+                            req_id,
+                            e,
+                            data_str[:120],
+                        )
+                        continue
 
-                chunk_index += 1
-                log_stream_chunk_debug(req_id, chunk_index, data)
+                    chunk_index += 1
+                    log_stream_chunk_debug(req_id, chunk_index, data)
 
-                if chunk_index == 1:
-                    upstream_id = data.get("id")
-                    upstream_model = data.get("model")
-                    logger.info(
-                        "[%s] upstream SSE | first_chunk | http_already_200 | id=%r model=%r",
-                        req_id,
-                        upstream_id,
-                        upstream_model,
-                    )
+                    if chunk_index == 1:
+                        upstream_id = data.get("id")
+                        upstream_model = data.get("model")
+                        logger.info(
+                            "[%s] upstream SSE | first_chunk | http_already_200 | id=%r model=%r",
+                            req_id,
+                            upstream_id,
+                            upstream_model,
+                        )
 
-                if data.get("usage"):
-                    last_usage = data["usage"]
+                    if data.get("usage"):
+                        last_usage = data["usage"]
 
-                fr = None
-                for ch in data.get("choices") or []:
-                    fr = fr or ch.get("finish_reason")
-                if fr:
-                    logger.info(
-                        "[%s] upstream SSE | chunk | finish_reason=%r | usage_this_chunk=%s",
-                        req_id,
-                        fr,
-                        data.get("usage"),
-                    )
+                    fr = None
+                    for ch in data.get("choices") or []:
+                        fr = fr or ch.get("finish_reason")
+                    if fr:
+                        logger.info(
+                            "[%s] upstream SSE | chunk | finish_reason=%r | usage_this_chunk=%s",
+                            req_id,
+                            fr,
+                            data.get("usage"),
+                        )
 
-                yield data
+                    yield data
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout, httpx.StreamError) as exc:
+            # 上游连接在中途断开（常见于负载均衡/上游模型超时）。
+            # 此时响应头已发给客户端，不能再返回 502，这里记录并优雅结束流。
+            stream_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "[%s] upstream SSE | stream_aborted | chunks=%s | err=%s",
+                req_id,
+                chunk_index,
+                stream_error,
+            )
     finally:
-        await response.aclose()
+        try:
+            await response.aclose()
+        except Exception as close_exc:
+            logger.debug("[%s] upstream SSE | aclose_error | %s", req_id, close_exc)
         elapsed_ms = (time.perf_counter() - t_upstream_start) * 1000
         logger.info(
             "[%s] upstream SSE | stream_closed | chunks=%s parse_errors=%s id=%r model=%r "
-            "last_usage=%s duration_ms=%.0f",
+            "last_usage=%s duration_ms=%.0f stream_error=%s",
             req_id,
             chunk_index,
             parse_errors,
@@ -126,6 +141,7 @@ async def stream_generator(response: httpx.Response, req_id: str, t_upstream_sta
             upstream_model,
             last_usage,
             elapsed_ms,
+            stream_error,
         )
 
 
@@ -302,33 +318,61 @@ async def handle_messages(request: Request):
 async def _openai_stream_passthrough(response: httpx.Response, req_id: str, t_start: float):
     """直接透传上游 SSE 数据，仅做日志记录。"""
     chunk_count = 0
+    done_sent = False
+    stream_error: str | None = None
     try:
-        async for line in response.aiter_lines():
-            if line.startswith("data: "):
-                data_str = line[6:]
-                if data_str.strip() == "[DONE]":
-                    yield f"data: [DONE]\n\n"
-                    logger.info("[%s] openai passthrough | [DONE] | chunks=%s", req_id, chunk_count)
-                    break
-                chunk_count += 1
-                if chunk_count == 1:
-                    try:
-                        first = json.loads(data_str)
-                        logger.info(
-                            "[%s] openai passthrough | first_chunk | id=%r model=%r",
-                            req_id, first.get("id"), first.get("model"),
-                        )
-                    except json.JSONDecodeError:
-                        pass
-                yield f"data: {data_str}\n\n"
-            elif line.strip():
-                yield f"{line}\n\n"
+        try:
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        done_sent = True
+                        logger.info("[%s] openai passthrough | [DONE] | chunks=%s", req_id, chunk_count)
+                        break
+                    chunk_count += 1
+                    if chunk_count == 1:
+                        try:
+                            first = json.loads(data_str)
+                            logger.info(
+                                "[%s] openai passthrough | first_chunk | id=%r model=%r",
+                                req_id, first.get("id"), first.get("model"),
+                            )
+                        except json.JSONDecodeError:
+                            pass
+                    yield f"data: {data_str}\n\n"
+                elif line.strip():
+                    yield f"{line}\n\n"
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout, httpx.StreamError) as exc:
+            # 上游中途断开连接：响应头已发回客户端，无法再改状态码，
+            # 这里记录日志，向客户端补一个 [DONE] 让它干净结束，避免悬挂。
+            stream_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "[%s] openai passthrough | stream_aborted | chunks=%s | err=%s",
+                req_id, chunk_count, stream_error,
+            )
+            if not done_sent:
+                try:
+                    err_payload = json.dumps({
+                        "error": {
+                            "type": "upstream_stream_error",
+                            "message": "Upstream connection closed before completion",
+                        }
+                    })
+                    yield f"data: {err_payload}\n\n"
+                    yield "data: [DONE]\n\n"
+                    done_sent = True
+                except Exception:
+                    pass
     finally:
-        await response.aclose()
+        try:
+            await response.aclose()
+        except Exception as close_exc:
+            logger.debug("[%s] openai passthrough | aclose_error | %s", req_id, close_exc)
         elapsed_ms = (time.perf_counter() - t_start) * 1000
         logger.info(
-            "[%s] openai passthrough | stream_closed | chunks=%s | duration_ms=%.0f",
-            req_id, chunk_count, elapsed_ms,
+            "[%s] openai passthrough | stream_closed | chunks=%s | duration_ms=%.0f | stream_error=%s",
+            req_id, chunk_count, elapsed_ms, stream_error,
         )
 
 
