@@ -41,9 +41,10 @@ async def lifespan(app: FastAPI):
         ),
     )
     logger.info(
-        "Startup | upstream_base_url=%s | log_level=%s",
+        "Startup | upstream_base_url=%s | log_level=%s | model_aliases=%s",
         settings.OPENAI_API_BASE,
         settings.LOG_LEVEL,
+        settings.MODEL_ALIASES or "<none>",
     )
     yield
     if http_client:
@@ -52,6 +53,27 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+def resolve_model_alias(model: str | None, req_id: str) -> str | None:
+    """
+    根据 settings.MODEL_ALIASES 把客户端模型名映射到上游模型名。
+
+    - 命中映射：返回映射后的名字，并打 INFO 日志记录原始名与映射后的名。
+    - 未命中或入参为空：原样返回（透传）。
+    """
+    if not model:
+        return model
+    mapped = settings.MODEL_ALIASES.get(model)
+    if mapped and mapped != model:
+        logger.info(
+            "[%s] model alias | %r -> %r",
+            req_id,
+            model,
+            mapped,
+        )
+        return mapped
+    return model
 
 
 async def stream_generator(response: httpx.Response, req_id: str, t_upstream_start: float):
@@ -184,6 +206,7 @@ async def handle_messages(request: Request):
         raise HTTPException(status_code=422, detail=f"Validation Error: {str(e)}")
 
     openai_req = claude_to_openai_request(claude_body)
+    openai_req["model"] = resolve_model_alias(openai_req.get("model"), req_id)
     logger.info("[%s] proxy -> upstream | prepared | %s", req_id, summarize_openai_request(openai_req))
     logger.debug("[%s] proxy -> upstream | openai_request_json=%s", req_id, json_preview(openai_req))
 
@@ -403,6 +426,9 @@ async def handle_chat_completions(request: Request):
     except json.JSONDecodeError:
         logger.warning("[%s] reject | invalid JSON body", req_id)
         raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    if isinstance(openai_req, dict) and openai_req.get("model"):
+        openai_req["model"] = resolve_model_alias(openai_req["model"], req_id)
 
     logger.info("[%s] proxy -> upstream | prepared | %s", req_id, summarize_openai_request(openai_req))
     logger.debug("[%s] proxy -> upstream | openai_request_json=%s", req_id, json_preview(openai_req))

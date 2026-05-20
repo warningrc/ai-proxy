@@ -14,7 +14,7 @@
 | `GET /v1/models`            | OpenAI Models API           | 直接透传上游模型列表，原样返回                                        |
 
 
-两个端点均支持**流式（SSE）和非流式**模式。代理不做模型名映射，客户端传什么 model 就原样转发。
+两个端点均支持**流式（SSE）和非流式**模式。默认情况下客户端传什么 model 就原样转发；如果在 `.env` 中配置了 `MODEL_ALIASES`，命中映射的模型名会被替换为上游模型名，未命中的仍然透传（详见下方「模型别名映射」）。
 
 ## 客户端接入
 
@@ -61,6 +61,24 @@ resp = client.chat.completions.create(
 | `OPENAI_API_BASE` | 第三方 OpenAI 兼容服务的 Base URL（配置里会自动补全末尾 `/`）                |
 | `OPENAI_API_KEY`  | 上游要求的 API Key                                            |
 | `LOG_LEVEL`       | `INFO`（默认）或 `DEBUG`；`DEBUG` 会打印上游每条 SSE 分片 JSON，流式时日志量很大 |
+| `MODEL_ALIASES`   | 可选，模型名映射表。命中映射的模型名会被替换后发给上游，未命中的原样透传                     |
+
+
+## 模型别名映射
+
+当客户端发来的模型名（例如 Claude Code 默认的 `claude-3-5-sonnet-20241022`）与上游可用的模型名不一致时，可以通过 `MODEL_ALIASES` 做一层重写。命中映射时会替换为上游模型名，未命中则原样透传，规则同时对 `/v1/messages` 和 `/v1/chat/completions` 生效。
+
+支持两种格式（任选其一）：
+
+```bash
+# 1) JSON 对象（推荐，模型名带特殊字符时更稳）
+MODEL_ALIASES={"claude-3-5-sonnet-20241022":"gpt-4o","claude-3-5-haiku-20241022":"gpt-4o-mini"}
+
+# 2) 逗号分隔的键值对
+MODEL_ALIASES=claude-3-5-sonnet-20241022=gpt-4o,claude-3-5-haiku-20241022=gpt-4o-mini
+```
+
+启动时日志会打印当前加载的映射，每次命中映射时也会以 `model alias | <原始名> -> <映射名>` 的形式记录到 INFO 日志中，便于排查。
 
 
 ## 运行
