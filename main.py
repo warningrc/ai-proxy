@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -26,6 +27,7 @@ from request_log import (
     summarize_openai_request,
     summarize_openai_response,
 )
+from usage_stats import UsageStats, UsageRecord, _mask_key
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL, logging.INFO),
@@ -39,6 +41,9 @@ ANTHROPIC_VERSION = "2023-06-01"
 
 # http_clients[provider_id][protocol] -> AsyncClient
 http_clients: Dict[str, Dict[str, httpx.AsyncClient]] = {}
+
+# 用量统计
+usage_stats = UsageStats(settings.STATS_DB)
 
 
 def _default_auth_headers(auth_style: str, api_key: str) -> Dict[str, str]:
@@ -113,6 +118,18 @@ async def lifespan(app: FastAPI):
         settings.LOG_LEVEL,
         routes_summary or "<none>",
     )
+
+    usage_stats.init_db()
+    if settings.TENANTS:
+        usage_stats.upsert_tenants([
+            {"id": t.id, "name": t.name, "api_key": t.api_key, "status": t.status}
+            for t in settings.TENANTS
+        ])
+        logger.info(
+            "Startup | tenants synced: %s",
+            [t.id for t in settings.TENANTS],
+        )
+
     yield
     for pid, by_proto in http_clients.items():
         for protocol, client in by_proto.items():
@@ -121,10 +138,26 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.debug("Shutdown | aclose %s/%s failed: %s", pid, protocol, e)
     http_clients.clear()
+    usage_stats.close()
     logger.info("Shutdown | all upstream HTTP clients closed")
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+def _extract_tenant(request: Request, req_id: str) -> str:
+    """从请求头提取 Bearer key 或 x-api-key，匹配租户。"""
+    raw_key: Optional[str] = None
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        raw_key = auth[7:].strip()
+    if not raw_key:
+        raw_key = request.headers.get("x-api-key", "").strip() or None
+
+    tenant_id = usage_stats.resolve_tenant(raw_key)
+    if tenant_id != "default" and raw_key:
+        logger.debug("[%s] tenant=%r (key=%s)", req_id, tenant_id, _mask_key(raw_key))
+    return tenant_id
 
 
 def resolve_model_route(model: str | None, req_id: str) -> Tuple[str, str | None]:
@@ -187,6 +220,79 @@ def _protocol_unsupported_response(
             }
         },
     )
+
+
+# ---------------------------------------------------------------------------
+#  Usage 提取辅助函数
+# ---------------------------------------------------------------------------
+
+def record_usage_async(record: UsageRecord) -> None:
+    """异步记录用量，避免 SQLite 同步 IO 阻塞事件循环。"""
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, usage_stats.record_usage, record)
+    except RuntimeError:
+        usage_stats.record_usage(record)
+
+
+def _check_tenant_allowance(tenant_id: str) -> None:
+    """
+    检查租户的配额和准入状态。
+    如果租户被禁用，抛出 403 异常。
+    """
+    info = usage_stats.get_tenant_info_by_id(tenant_id)
+    if info and info.status != "active":
+        raise HTTPException(
+            status_code=403,
+            detail=f"Tenant account {tenant_id!r} ({info.name}) is {info.status!r}",
+        )
+    # 未来可在此扩展 quota 消费检查
+
+
+def _record_anthropic_usage(
+    req_id: str, tenant_id: str, provider_id: str,
+    model: str, duration_ms: float, data: dict,
+) -> None:
+    """从 Anthropic 非流式响应中提取 usage 并记录。"""
+    u = data.get("usage") or {}
+    record_usage_async(UsageRecord(
+        req_id=req_id,
+        tenant_id=tenant_id,
+        provider=provider_id,
+        model=model,
+        endpoint="messages",
+        input_tokens=u.get("input_tokens", 0),
+        output_tokens=u.get("output_tokens", 0),
+        cache_read_tokens=u.get("cache_read_input_tokens", 0),
+        cache_creation_tokens=u.get("cache_creation_input_tokens", 0),
+        duration_ms=duration_ms,
+    ))
+
+
+def _record_openai_usage(
+    req_id: str, tenant_id: str, provider_id: str,
+    model: str, endpoint: str, duration_ms: float, data: dict,
+) -> None:
+    """从 OpenAI 非流式响应中提取 usage 并记录。"""
+    u = data.get("usage") or {}
+    cache_read = 0
+    details = u.get("prompt_tokens_details") or {}
+    if isinstance(details, dict):
+        cache_read = details.get("cached_tokens", 0)
+    if cache_read == 0:
+        cache_read = u.get("prompt_cache_hit_tokens", 0)
+    record_usage_async(UsageRecord(
+        req_id=req_id,
+        tenant_id=tenant_id,
+        provider=provider_id,
+        model=model,
+        endpoint=endpoint,
+        input_tokens=u.get("prompt_tokens", 0),
+        output_tokens=u.get("completion_tokens", 0),
+        cache_read_tokens=cache_read,
+        cache_creation_tokens=0,
+        duration_ms=duration_ms,
+    ))
 
 
 async def stream_generator(response: httpx.Response, req_id: str, t_upstream_start: float):
@@ -281,17 +387,44 @@ async def stream_generator(response: httpx.Response, req_id: str, t_upstream_sta
 
 
 async def _anthropic_stream_passthrough(
-    response: httpx.Response, req_id: str, t_start: float
+    response: httpx.Response, req_id: str, t_start: float,
+    tenant_id: str = "default", provider_id: str = "", model: str = "",
 ):
-    """直接转发 Anthropic SSE 字节流，不做事件解析。"""
+    """转发 Anthropic SSE 流，同时解析 usage 事件用于统计。"""
     bytes_count = 0
     stream_error: Optional[str] = None
+    input_tokens = 0
+    output_tokens = 0
+    cache_read_tokens = 0
+    cache_creation_tokens = 0
+
     try:
         try:
-            async for chunk in response.aiter_bytes():
-                if chunk:
-                    bytes_count += len(chunk)
-                    yield chunk
+            current_event = ""
+            async for line in response.aiter_lines():
+                raw_line = line + "\n"
+                bytes_count += len(raw_line.encode("utf-8"))
+                yield raw_line
+
+                # SSE 解析：提取 event type 和 data
+                if line.startswith("event: "):
+                    current_event = line[7:].strip()
+                elif line.startswith("data: ") and current_event:
+                    try:
+                        data = json.loads(line[6:])
+                        if current_event == "message_start":
+                            msg = data.get("message", {})
+                            u = msg.get("usage", {})
+                            input_tokens += u.get("input_tokens", 0)
+                            cache_read_tokens += u.get("cache_read_input_tokens", 0)
+                            cache_creation_tokens += u.get("cache_creation_input_tokens", 0)
+                        elif current_event == "message_delta":
+                            u = data.get("usage", {})
+                            output_tokens += u.get("output_tokens", 0)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                elif line == "":
+                    current_event = ""
         except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout, httpx.StreamError) as exc:
             stream_error = f"{type(exc).__name__}: {exc}"
             logger.warning(
@@ -305,9 +438,23 @@ async def _anthropic_stream_passthrough(
             logger.debug("[%s] anthropic passthrough | aclose_error | %s", req_id, close_exc)
         elapsed_ms = (time.perf_counter() - t_start) * 1000
         logger.info(
-            "[%s] anthropic passthrough | stream_closed | bytes=%s | duration_ms=%.0f | stream_error=%s",
-            req_id, bytes_count, elapsed_ms, stream_error,
+            "[%s] anthropic passthrough | stream_closed | bytes=%s | duration_ms=%.0f | "
+            "input=%d output=%d cache_read=%d | stream_error=%s",
+            req_id, bytes_count, elapsed_ms,
+            input_tokens, output_tokens, cache_read_tokens, stream_error,
         )
+        record_usage_async(UsageRecord(
+            req_id=req_id,
+            tenant_id=tenant_id,
+            provider=provider_id,
+            model=model,
+            endpoint="messages",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+            duration_ms=elapsed_ms,
+        ))
 
 
 async def _handle_messages_anthropic_passthrough(
@@ -316,6 +463,7 @@ async def _handle_messages_anthropic_passthrough(
     upstream_model: Optional[str],
     claude_body_dict: dict,
     query_string: str = "",
+    tenant_id: str = "default",
 ):
     """provider 原生支持 Anthropic 协议 → 仅替换 model 字段，直接透传 body 与 query。"""
     client = _get_client(provider_id, PROTOCOL_ANTHROPIC)
@@ -368,7 +516,11 @@ async def _handle_messages_anthropic_passthrough(
             return JSONResponse(status_code=r.status_code, content=err_content)
 
         return StreamingResponse(
-            _anthropic_stream_passthrough(r, req_id, t0),
+            _anthropic_stream_passthrough(
+                r, req_id, t0,
+                tenant_id=tenant_id, provider_id=provider_id,
+                model=claude_body_dict.get("model", ""),
+            ),
             media_type="text/event-stream",
         )
 
@@ -413,6 +565,8 @@ async def _handle_messages_anthropic_passthrough(
         )
         raise HTTPException(status_code=502, detail="Upstream returned non-JSON body")
 
+    _record_anthropic_usage(req_id, tenant_id, provider_id,
+                            claude_body_dict.get("model", ""), elapsed_ms, data)
     return JSONResponse(content=data)
 
 
@@ -421,6 +575,7 @@ async def _handle_messages_openai_convert(
     provider_id: str,
     upstream_model: Optional[str],
     claude_body_dict: dict,
+    tenant_id: str = "default",
 ):
     """provider 仅支持 OpenAI 协议 → 走 claude→openai 转换 + openai→claude 反转。"""
     client = _get_client(provider_id, PROTOCOL_OPENAI)
@@ -499,8 +654,26 @@ async def _handle_messages_openai_convert(
                 }
             return JSONResponse(status_code=r.status_code, content=err_content)
 
+        def on_usage(u: dict):
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            record_usage_async(UsageRecord(
+                req_id=req_id,
+                tenant_id=tenant_id,
+                provider=provider_id,
+                model=openai_req.get("model", ""),
+                endpoint="messages",
+                input_tokens=u.get("input_tokens", 0),
+                output_tokens=u.get("output_tokens", 0),
+                cache_read_tokens=u.get("cache_read_tokens", 0),
+                cache_creation_tokens=u.get("cache_creation_tokens", 0),
+                duration_ms=elapsed_ms,
+            ))
+
         return StreamingResponse(
-            openai_to_claude_stream(stream_generator(r, req_id, t0)),
+            openai_to_claude_stream(
+                stream_generator(r, req_id, t0),
+                on_usage_done=on_usage,
+            ),
             media_type="text/event-stream",
         )
 
@@ -564,6 +737,15 @@ async def _handle_messages_openai_convert(
     logger.info("[%s] upstream | ok | %s", req_id, summarize_openai_response(data))
     logger.debug("[%s] upstream | response_body=%s", req_id, json_preview(data))
 
+    _record_openai_usage(
+        req_id=req_id,
+        tenant_id=tenant_id,
+        provider_id=provider_id,
+        model=openai_req.get("model", ""),
+        endpoint="messages",
+        duration_ms=elapsed_ms,
+        data=data,
+    )
     return JSONResponse(content=openai_to_claude_response(data))
 
 
@@ -601,6 +783,8 @@ async def handle_messages(request: Request):
     if not isinstance(claude_body_dict, dict):
         raise HTTPException(status_code=400, detail="Request body must be a JSON object")
 
+    tenant_id = _extract_tenant(request, req_id)
+    _check_tenant_allowance(tenant_id)
     provider_id, upstream_model = resolve_model_route(claude_body_dict.get("model"), req_id)
     provider = settings.PROVIDERS.get(provider_id)
     if provider is None:
@@ -612,11 +796,13 @@ async def handle_messages(request: Request):
         return await _handle_messages_anthropic_passthrough(
             req_id, provider_id, upstream_model, claude_body_dict,
             query_string=request.url.query,
+            tenant_id=tenant_id,
         )
     # openai-convert 分支不透传 query：原 Anthropic 协议的 query（如 ?beta=true）
     # 对 OpenAI 上游没意义，强行带上反而可能引起 400。
     return await _handle_messages_openai_convert(
         req_id, provider_id, upstream_model, claude_body_dict,
+        tenant_id=tenant_id,
     )
 
 
@@ -624,11 +810,15 @@ async def handle_messages(request: Request):
 #  OpenAI Chat Completions 透传接口
 # ---------------------------------------------------------------------------
 
-async def _openai_stream_passthrough(response: httpx.Response, req_id: str, t_start: float):
-    """直接透传上游 SSE 数据，仅做日志记录。"""
+async def _openai_stream_passthrough(
+    response: httpx.Response, req_id: str, t_start: float,
+    tenant_id: str = "default", provider_id: str = "", model: str = "",
+):
+    """直接透传上游 SSE 数据，并解析其中包含的 usage 记录用量。"""
     chunk_count = 0
     done_sent = False
     stream_error: str | None = None
+    last_usage = None
     try:
         try:
             async for line in response.aiter_lines():
@@ -640,15 +830,17 @@ async def _openai_stream_passthrough(response: httpx.Response, req_id: str, t_st
                         logger.info("[%s] openai passthrough | [DONE] | chunks=%s", req_id, chunk_count)
                         break
                     chunk_count += 1
-                    if chunk_count == 1:
-                        try:
-                            first = json.loads(data_str)
+                    try:
+                        data = json.loads(data_str)
+                        if data.get("usage"):
+                            last_usage = data["usage"]
+                        if chunk_count == 1:
                             logger.info(
                                 "[%s] openai passthrough | first_chunk | id=%r model=%r",
-                                req_id, first.get("id"), first.get("model"),
+                                req_id, data.get("id"), data.get("model"),
                             )
-                        except json.JSONDecodeError:
-                            pass
+                    except json.JSONDecodeError:
+                        pass
                     yield f"data: {data_str}\n\n"
                 elif line.strip():
                     yield f"{line}\n\n"
@@ -680,9 +872,28 @@ async def _openai_stream_passthrough(response: httpx.Response, req_id: str, t_st
             logger.debug("[%s] openai passthrough | aclose_error | %s", req_id, close_exc)
         elapsed_ms = (time.perf_counter() - t_start) * 1000
         logger.info(
-            "[%s] openai passthrough | stream_closed | chunks=%s | duration_ms=%.0f | stream_error=%s",
-            req_id, chunk_count, elapsed_ms, stream_error,
+            "[%s] openai passthrough | stream_closed | chunks=%s | duration_ms=%.0f | stream_error=%s | last_usage=%s",
+            req_id, chunk_count, elapsed_ms, stream_error, last_usage,
         )
+        if last_usage:
+            cache_read = 0
+            details = last_usage.get("prompt_tokens_details") or {}
+            if isinstance(details, dict):
+                cache_read = details.get("cached_tokens", 0)
+            if cache_read == 0:
+                cache_read = last_usage.get("prompt_cache_hit_tokens", 0)
+            record_usage_async(UsageRecord(
+                req_id=req_id,
+                tenant_id=tenant_id,
+                provider=provider_id,
+                model=model,
+                endpoint="chat/completions",
+                input_tokens=last_usage.get("prompt_tokens", 0),
+                output_tokens=last_usage.get("completion_tokens", 0),
+                cache_read_tokens=cache_read,
+                cache_creation_tokens=0,
+                duration_ms=elapsed_ms,
+            ))
 
 
 @app.post("/v1/chat/completions")
@@ -714,6 +925,8 @@ async def handle_chat_completions(request: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     client_model = openai_req.get("model") if isinstance(openai_req, dict) else None
+    tenant_id = _extract_tenant(request, req_id)
+    _check_tenant_allowance(tenant_id)
     provider_id, upstream_model = resolve_model_route(client_model, req_id)
     if isinstance(openai_req, dict) and upstream_model is not None:
         openai_req["model"] = upstream_model
@@ -733,6 +946,11 @@ async def handle_chat_completions(request: Request):
     is_stream = openai_req.get("stream", False)
 
     if is_stream:
+        if "stream_options" not in openai_req:
+            openai_req["stream_options"] = {"include_usage": True}
+        elif isinstance(openai_req["stream_options"], dict):
+            openai_req["stream_options"]["include_usage"] = True
+
         built = client.build_request("POST", upstream_path, json=openai_req)
         logger.info(
             "[%s] proxy -> upstream | POST %s%s | provider=%r | model=%r | stream=true (passthrough)",
@@ -761,7 +979,11 @@ async def handle_chat_completions(request: Request):
             return JSONResponse(status_code=r.status_code, content=err_content)
 
         return StreamingResponse(
-            _openai_stream_passthrough(r, req_id, t0),
+            _openai_stream_passthrough(
+                r, req_id, t0,
+                tenant_id=tenant_id, provider_id=provider_id,
+                model=openai_req.get("model", ""),
+            ),
             media_type="text/event-stream",
         )
 
@@ -803,6 +1025,15 @@ async def handle_chat_completions(request: Request):
         raise HTTPException(status_code=502, detail="Upstream returned non-JSON body")
 
     logger.info("[%s] upstream | ok | %s", req_id, summarize_openai_response(data))
+    _record_openai_usage(
+        req_id=req_id,
+        tenant_id=tenant_id,
+        provider_id=provider_id,
+        model=openai_req.get("model", ""),
+        endpoint="chat/completions",
+        duration_ms=elapsed_ms,
+        data=data,
+    )
     return JSONResponse(content=data)
 
 
@@ -853,6 +1084,41 @@ async def handle_list_models(request: Request):
     model_count = len(data.get("data", []))
     logger.info("[%s] upstream | ok | models_count=%s", req_id, model_count)
     return JSONResponse(content=data)
+
+
+# ---------------------------------------------------------------------------
+#  统计查询接口
+# ---------------------------------------------------------------------------
+
+@app.get("/stats")
+async def get_stats(
+    group_by: str = "model",
+    since: Optional[str] = None,
+    until: Optional[str] = None,
+    model: Optional[str] = None,
+    tenant: Optional[str] = None,
+    provider: Optional[str] = None,
+):
+    """
+    用量统计查询接口。
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(
+            None,
+            lambda: usage_stats.query_stats(
+                group_by=group_by,
+                since=since,
+                until=until,
+                model=model,
+                tenant=tenant,
+                provider=provider,
+            )
+        )
+        return JSONResponse(content=res)
+    except Exception as e:
+        logger.error("Failed to query stats: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to query stats: {str(e)}")
 
 
 if __name__ == "__main__":

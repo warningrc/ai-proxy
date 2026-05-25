@@ -86,6 +86,15 @@ class ModelRoute:
     upstream_model: Optional[str] = None
 
 
+@dataclass
+class TenantConfig:
+    """一个租户的配置信息。"""
+    id: str
+    name: str
+    api_key: str  # 明文，仅在启动时哈希后用于匹配
+    status: str = "active"
+
+
 # ---------------------------------------------------------------------------
 #  辅助
 # ---------------------------------------------------------------------------
@@ -244,6 +253,50 @@ def _parse_providers(raw: Any) -> List[ProviderConfig]:
     return providers
 
 
+def _parse_tenants(raw: Any) -> List[TenantConfig]:
+    """解析 [[tenants]]。允许为空（表示无租户配置，所有请求落到 'default'）。"""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        _die("配置 tenants 必须是数组（请使用 [[tenants]] 数组表）。")
+
+    seen_ids: set[str] = set()
+    seen_keys: set[str] = set()
+    tenants: List[TenantConfig] = []
+
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            _die(f"tenants[{i}] 必须是表（table），实际为 {type(item).__name__}")
+
+        tid = str(item.get("id", "")).strip()
+        if not tid:
+            _die(f"tenants[{i}] 缺少 id")
+        if tid == "default":
+            _die(f"tenants[{i}].id 不能为 'default'（保留给未匹配租户的占位）")
+        if tid in seen_ids:
+            _die(f"tenants 中存在重复 id: {tid!r}")
+        seen_ids.add(tid)
+
+        name = str(item.get("name", "")).strip()
+        if not name:
+            _die(f"tenants[{tid!r}] 缺少 name")
+
+        api_key = str(item.get("api_key", "")).strip()
+        if not api_key:
+            _die(f"tenants[{tid!r}] 缺少 api_key")
+        if api_key in seen_keys:
+            _die(f"tenants[{tid!r}].api_key 与其他租户重复")
+        seen_keys.add(api_key)
+
+        status = str(item.get("status", "active")).strip().lower()
+        if status not in ("active", "disabled"):
+            _die(f"tenants[{tid!r}].status 必须是 'active' 或 'disabled'")
+
+        tenants.append(TenantConfig(id=tid, name=name, api_key=api_key, status=status))
+
+    return tenants
+
+
 def _parse_model_routes(
     raw: Any,
     known_provider_ids: set[str],
@@ -312,6 +365,8 @@ class Settings:
     PROVIDERS: Dict[str, ProviderConfig]
     DEFAULT_PROVIDER_ID: str
     MODEL_ROUTES: Dict[str, List[ModelRoute]]
+    TENANTS: List[TenantConfig]
+    STATS_DB: str
 
     LOG_LEVEL: str
     MAX_BODY_SIZE: int
@@ -349,9 +404,13 @@ class Settings:
             known_provider_ids=set(self.PROVIDERS),
         )
 
-        # --- 4. 其他全局参数 ---
+        # --- 4. tenants ---
+        self.TENANTS = _parse_tenants(data.get("tenants"))
+
+        # --- 5. 其他全局参数 ---
         self.LOG_LEVEL = str(data.get("log_level", "INFO")).upper()
         self.MAX_BODY_SIZE = int(data.get("max_body_size", 15728640))
+        self.STATS_DB = str(data.get("stats_db", "./stats.db")).strip()
 
         timeouts = data.get("timeouts", {}) or {}
         if not isinstance(timeouts, dict):

@@ -15,7 +15,7 @@ case "$1" in
             exit 0
         fi
         cd "$DIR"
-        nohup uv run main.py >> "$LOG_DIR/app.log" 2>&1 &
+        nohup ./.venv/bin/python main.py >> "$LOG_DIR/app.log" 2>&1 &
         echo $! > "$PID_FILE"
         echo "已启动 (PID: $!), 日志: $LOG_DIR/app.log"
         ;;

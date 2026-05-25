@@ -1,7 +1,7 @@
 import time
 import json
 import logging
-from typing import Dict, Any, AsyncGenerator
+from typing import Dict, Any, AsyncGenerator, Callable, Optional
 
 logger = logging.getLogger("ai-proxy")
 
@@ -125,6 +125,8 @@ def claude_to_openai_request(claude_data: Dict[str, Any]) -> Dict[str, Any]:
         "messages": openai_messages,
         "stream": claude_data.get("stream", False),
     }
+    if claude_data.get("stream", False):
+        openai_req["stream_options"] = {"include_usage": True}
 
     # Tools Mapping
     if "tools" in claude_data:
@@ -249,7 +251,11 @@ def openai_to_claude_response(openai_data: Dict[str, Any]) -> Dict[str, Any]:
         }
     }
 
-async def openai_to_claude_stream(openai_stream_generator, fallback_model: str = "claude-3-5-sonnet") -> AsyncGenerator[str, None]:
+async def openai_to_claude_stream(
+    openai_stream_generator,
+    fallback_model: str = "claude-3-5-sonnet",
+    on_usage_done: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> AsyncGenerator[str, None]:
     """
     Convert OpenAI streaming chunks to Claude SSE events.
     Handles Text, Tool Calls, and Usage with improved protocol fidelity.
@@ -268,99 +274,123 @@ async def openai_to_claude_stream(openai_stream_generator, fallback_model: str =
     msg_id = None
     msg_model = None
     
-    accumulated_usage = {"input_tokens": 0, "output_tokens": 0}
+    accumulated_usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+    }
     
-    async for chunk in openai_stream_generator:
-        # Handle dict or Pydantic object
-        data = chunk if isinstance(chunk, dict) else chunk.model_dump() if hasattr(chunk, 'model_dump') else {}
-        
-        # Capture metadata from first chunk(s)
-        if not msg_id and data.get("id"):
-            msg_id = data["id"]
-        if not msg_model and data.get("model"):
-            msg_model = data["model"]
+    try:
+        async for chunk in openai_stream_generator:
+            # Handle dict or Pydantic object
+            data = chunk if isinstance(chunk, dict) else chunk.model_dump() if hasattr(chunk, 'model_dump') else {}
             
-        # If we haven't sent start yet, and we have enough info OR we have content, send it.
-        # Ideally we send it immediately on first chunk.
-        if not has_sent_start:
-            # Fallbacks
-            final_id = msg_id or f"msg_{int(time.time())}"
-            final_model = msg_model or fallback_model
-            
-            yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': final_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': final_model, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
-            has_sent_start = True
-
-        # Check for usage at the end (stream_options: {include_usage: true})
-        if data.get("usage"):
-            # Update accumulated usage
-            u = data["usage"]
-            accumulated_usage["input_tokens"] = u.get("prompt_tokens", 0)
-            accumulated_usage["output_tokens"] = u.get("completion_tokens", 0)
-
-        choices = data.get("choices", [])
-        if not choices:
-            continue
-            
-        delta = choices[0].get("delta", {})
-        
-        # 1. Handle Content (Text)
-        content_delta = delta.get("content")
-        if content_delta:
-            if not text_block_started:
-                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': current_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                text_block_started = True
-            
-            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': current_block_index, 'delta': {'type': 'text_delta', 'text': content_delta}})}\n\n"
-
-        # 2. Handle Tool Calls
-        tool_calls_delta = delta.get("tool_calls")
-        if tool_calls_delta:
-            if text_block_started:
-                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index})}\n\n"
-                 text_block_started = False
-                 current_block_index += 1
-
-            for tc in tool_calls_delta:
-                idx = tc.get("index")
-                # OpenAI indices are reliable per choice
+            # Capture metadata from first chunk(s)
+            if not msg_id and data.get("id"):
+                msg_id = data["id"]
+            if not msg_model and data.get("model"):
+                msg_model = data["model"]
                 
-                # New tool call start
-                if idx not in tool_index_to_block_index:
-                    tool_index_to_block_index[idx] = current_block_index
-                    current_block_index += 1
+            # If we haven't sent start yet, and we have enough info OR we have content, send it.
+            # Ideally we send it immediately on first chunk.
+            if not has_sent_start:
+                # Fallbacks
+                final_id = msg_id or f"msg_{int(time.time())}"
+                final_model = msg_model or fallback_model
+                
+                yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': final_id, 'type': 'message', 'role': 'assistant', 'content': [], 'model': final_model, 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})}\n\n"
+                has_sent_start = True
+    
+            # Check for usage at the end (stream_options: {include_usage: true})
+            if data.get("usage"):
+                # Update accumulated usage
+                u = data["usage"]
+                accumulated_usage["input_tokens"] = u.get("prompt_tokens", 0)
+                accumulated_usage["output_tokens"] = u.get("completion_tokens", 0)
+                
+                cache_read = 0
+                details = u.get("prompt_tokens_details") or {}
+                if isinstance(details, dict):
+                    cache_read = details.get("cached_tokens", 0)
+                if cache_read == 0:
+                    cache_read = u.get("prompt_cache_hit_tokens", 0)
+                accumulated_usage["cache_read_tokens"] = cache_read
+    
+            choices = data.get("choices", [])
+            if not choices:
+                continue
+                
+            delta = choices[0].get("delta", {})
+            
+            # 1. Handle Content (Text)
+            content_delta = delta.get("content")
+            if content_delta:
+                if not text_block_started:
+                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': current_block_index, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                    text_block_started = True
+                
+                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': current_block_index, 'delta': {'type': 'text_delta', 'text': content_delta}})}\n\n"
+    
+            # 2. Handle Tool Calls
+            tool_calls_delta = delta.get("tool_calls")
+            if tool_calls_delta:
+                if text_block_started:
+                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index})}\n\n"
+                     text_block_started = False
+                     current_block_index += 1
+    
+                for tc in tool_calls_delta:
+                    idx = tc.get("index")
+                    # OpenAI indices are reliable per choice
                     
-                    t_id = tc.get("id", "")
-                    t_name = tc.get("function", {}).get("name", "")
+                    # New tool call start
+                    if idx not in tool_index_to_block_index:
+                        tool_index_to_block_index[idx] = current_block_index
+                        current_block_index += 1
+                        
+                        t_id = tc.get("id", "")
+                        t_name = tc.get("function", {}).get("name", "")
+                        
+                        # Emit start
+                        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': tool_index_to_block_index[idx], 'content_block': {'type': 'tool_use', 'id': t_id, 'name': t_name, 'input': {}}})}\n\n"
                     
-                    # Emit start
-                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': tool_index_to_block_index[idx], 'content_block': {'type': 'tool_use', 'id': t_id, 'name': t_name, 'input': {}}})}\n\n"
+                    b_idx = tool_index_to_block_index[idx]
+                    
+                    # Args delta
+                    args = tc.get("function", {}).get("arguments")
+                    if args:
+                         yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': b_idx, 'delta': {'type': 'input_json_delta', 'partial_json': args}})}\n\n"
+    
+    
+            # 3. Handle Finish
+            finish_reason = choices[0].get("finish_reason")
+            if finish_reason:
+                # Close blocks
+                if text_block_started:
+                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index})}\n\n"
+                     text_block_started = False
+    
+                for idx in tool_index_to_block_index.values():
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n"
+    
+                stop_reason = "end_turn"
+                if finish_reason == "length":
+                    stop_reason = "max_tokens"
+                elif finish_reason == "tool_calls":
+                    stop_reason = "tool_use"
+                    
+                yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': accumulated_usage['output_tokens']}})}\n\n"
                 
-                b_idx = tool_index_to_block_index[idx]
-                
-                # Args delta
-                args = tc.get("function", {}).get("arguments")
-                if args:
-                     yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': b_idx, 'delta': {'type': 'input_json_delta', 'partial_json': args}})}\n\n"
-
-
-        # 3. Handle Finish
-        finish_reason = choices[0].get("finish_reason")
-        if finish_reason:
-            # Close blocks
-            if text_block_started:
-                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': current_block_index})}\n\n"
-                 text_block_started = False
-
-            for idx in tool_index_to_block_index.values():
-                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': idx})}\n\n"
-
-            stop_reason = "end_turn"
-            if finish_reason == "length":
-                stop_reason = "max_tokens"
-            elif finish_reason == "tool_calls":
-                stop_reason = "tool_use"
-                
-            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': {'output_tokens': accumulated_usage['output_tokens']}})}\n\n"
-            
-    # Final cleanup if loop finishes naturally
-    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+        # Final cleanup if loop finishes naturally
+        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+    finally:
+        if on_usage_done:
+            try:
+                import inspect
+                if inspect.iscoroutinefunction(on_usage_done):
+                    await on_usage_done(accumulated_usage)
+                else:
+                    on_usage_done(accumulated_usage)
+            except Exception as e:
+                logger.warning("on_usage_done callback failed: %s", e)

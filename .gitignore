@@ -15,3 +15,9 @@ config.toml
 
 # Logs
 logs/
+
+.cursor/
+
+.idea/
+
+.vscode/
