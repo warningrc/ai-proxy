@@ -2,12 +2,22 @@ import json
 import logging
 import time
 import uuid
-import httpx
 from contextlib import asynccontextmanager
+from typing import Dict, Optional, Tuple
+
+import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 
-from config import settings
+from config import (
+    AUTH_STYLE_ANTHROPIC,
+    AUTH_STYLE_BEARER,
+    AUTH_STYLE_NONE,
+    PROTOCOL_ANTHROPIC,
+    PROTOCOL_OPENAI,
+    ProviderEndpoint,
+    settings,
+)
 from schemas import ClaudeChatRequest
 from converters import claude_to_openai_request, openai_to_claude_response, openai_to_claude_stream
 from request_log import (
@@ -24,15 +34,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ai-proxy")
 
-http_client: httpx.AsyncClient | None = None
+# Anthropic 协议默认要求的版本头。可被 endpoint.headers 覆盖。
+ANTHROPIC_VERSION = "2023-06-01"
+
+# http_clients[provider_id][protocol] -> AsyncClient
+http_clients: Dict[str, Dict[str, httpx.AsyncClient]] = {}
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global http_client
-    http_client = httpx.AsyncClient(
-        base_url=settings.OPENAI_API_BASE,
-        headers={"Authorization": f"Bearer {settings.OPENAI_API_KEY}"},
+def _default_auth_headers(auth_style: str, api_key: str) -> Dict[str, str]:
+    """根据 auth_style 派发默认鉴权头（可被 endpoint.headers 覆盖）。"""
+    if auth_style == AUTH_STYLE_BEARER:
+        return {"Authorization": f"Bearer {api_key}"}
+    if auth_style == AUTH_STYLE_ANTHROPIC:
+        return {
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+        }
+    if auth_style == AUTH_STYLE_NONE:
+        return {}
+    raise ValueError(f"unknown auth_style: {auth_style!r}")
+
+
+def _build_client(protocol: str, endpoint: ProviderEndpoint) -> httpx.AsyncClient:
+    headers = _default_auth_headers(endpoint.auth_style, endpoint.api_key)
+    headers.update(endpoint.headers or {})
+    return httpx.AsyncClient(
+        base_url=endpoint.base_url,
+        headers=headers,
         timeout=httpx.Timeout(
             connect=settings.TIMEOUT_CONNECT,
             read=settings.TIMEOUT_READ,
@@ -40,40 +68,125 @@ async def lifespan(app: FastAPI):
             pool=settings.TIMEOUT_POOL,
         ),
     )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    providers_summary: Dict[str, Dict[str, Dict[str, str]]] = {}
+    for pid, p in settings.PROVIDERS.items():
+        http_clients[pid] = {}
+        summary: Dict[str, Dict[str, str]] = {}
+        if p.openai:
+            http_clients[pid][PROTOCOL_OPENAI] = _build_client(PROTOCOL_OPENAI, p.openai)
+            summary[PROTOCOL_OPENAI] = {
+                "base_url": p.openai.base_url,
+                "auth_style": p.openai.auth_style,
+            }
+        if p.anthropic:
+            # Anthropic 端点路径里 v1 由代码自动拼，base_url 不应再带 /v1，
+            # 否则最终会变成 .../v1/v1/messages。这里给一条显式提醒。
+            if p.anthropic.base_url.rstrip("/").endswith("/v1"):
+                logger.warning(
+                    "Provider %r anthropic.base_url=%r 末尾带了 '/v1'；"
+                    "代码会再拼一次 v1/messages，最终路径会出现两次 v1。"
+                    "请把 base_url 末尾的 /v1 去掉。",
+                    pid, p.anthropic.base_url,
+                )
+            http_clients[pid][PROTOCOL_ANTHROPIC] = _build_client(PROTOCOL_ANTHROPIC, p.anthropic)
+            summary[PROTOCOL_ANTHROPIC] = {
+                "base_url": p.anthropic.base_url,
+                "auth_style": p.anthropic.auth_style,
+            }
+        providers_summary[pid] = summary
+
+    routes_summary = {
+        client_model: [
+            {"provider": r.provider_id, "model": r.upstream_model or "<passthrough>"}
+            for r in routes
+        ]
+        for client_model, routes in settings.MODEL_ROUTES.items()
+    }
     logger.info(
-        "Startup | upstream_base_url=%s | log_level=%s | model_aliases=%s",
-        settings.OPENAI_API_BASE,
+        "Startup | providers=%s | default_provider=%r | log_level=%s | routes=%s",
+        providers_summary,
+        settings.DEFAULT_PROVIDER_ID,
         settings.LOG_LEVEL,
-        settings.MODEL_ALIASES or "<none>",
+        routes_summary or "<none>",
     )
     yield
-    if http_client:
-        await http_client.aclose()
-        logger.info("Shutdown | upstream HTTP client closed")
+    for pid, by_proto in http_clients.items():
+        for protocol, client in by_proto.items():
+            try:
+                await client.aclose()
+            except Exception as e:
+                logger.debug("Shutdown | aclose %s/%s failed: %s", pid, protocol, e)
+    http_clients.clear()
+    logger.info("Shutdown | all upstream HTTP clients closed")
 
 
 app = FastAPI(lifespan=lifespan)
 
 
-def resolve_model_alias(model: str | None, req_id: str) -> str | None:
+def resolve_model_route(model: str | None, req_id: str) -> Tuple[str, str | None]:
     """
-    根据 settings.MODEL_ALIASES 把客户端模型名映射到上游模型名。
+    把客户端传入的 model 解析为 (provider_id, upstream_model)。
 
-    - 命中映射：返回映射后的名字，并打 INFO 日志记录原始名与映射后的名。
-    - 未命中或入参为空：原样返回（透传）。
+    - 命中 MODEL_ROUTES：取第一条路由（未来 failover 在此扩展为遍历）。
+      若 upstream_model 为空则透传客户端模型名。
+    - 未命中：使用默认 provider，且模型名原样透传。
+    - 命中时打 INFO 日志，未命中保持安静。
     """
     if not model:
-        return model
-    mapped = settings.MODEL_ALIASES.get(model)
-    if mapped and mapped != model:
-        logger.info(
-            "[%s] model alias | %r -> %r",
-            req_id,
-            model,
-            mapped,
+        return settings.DEFAULT_PROVIDER_ID, model
+
+    routes = settings.MODEL_ROUTES.get(model)
+    if not routes:
+        return settings.DEFAULT_PROVIDER_ID, model
+
+    if len(routes) > 1:
+        logger.warning(
+            "[%s] model route | %r has %d routes; multi-provider failover not yet implemented, using first",
+            req_id, model, len(routes),
         )
-        return mapped
-    return model
+    route = routes[0]
+    upstream_model = route.upstream_model or model
+    logger.info(
+        "[%s] model route | %r -> provider=%r model=%r",
+        req_id, model, route.provider_id, upstream_model,
+    )
+    return route.provider_id, upstream_model
+
+
+def _get_client(provider_id: str, protocol: str) -> Optional[httpx.AsyncClient]:
+    """返回 client；找不到返回 None（调用方决定 502 还是 500）。"""
+    return http_clients.get(provider_id, {}).get(protocol)
+
+
+def _append_query(path: str, query_string: str) -> str:
+    """把客户端原请求的 query string 附加到上游相对路径。"""
+    if not query_string:
+        return path
+    sep = "&" if "?" in path else "?"
+    return f"{path}{sep}{query_string}"
+
+
+def _protocol_unsupported_response(
+    req_id: str, provider_id: str, protocol: str
+) -> JSONResponse:
+    """provider 未声明该协议端点时统一的 502 响应。"""
+    msg = (
+        f"Provider {provider_id!r} does not expose {protocol!r} protocol"
+    )
+    logger.warning("[%s] %s", req_id, msg)
+    return JSONResponse(
+        status_code=502,
+        content={
+            "error": {
+                "type": "provider_protocol_unsupported",
+                "message": msg,
+            }
+        },
+    )
 
 
 async def stream_generator(response: httpx.Response, req_id: str, t_upstream_start: float):
@@ -167,37 +280,154 @@ async def stream_generator(response: httpx.Response, req_id: str, t_upstream_sta
         )
 
 
-@app.post("/v1/messages")
-async def handle_messages(request: Request):
-    if http_client is None:
-        logger.error("Server not initialized properly")
-        raise HTTPException(status_code=500, detail="Server not initialized properly")
+async def _anthropic_stream_passthrough(
+    response: httpx.Response, req_id: str, t_start: float
+):
+    """直接转发 Anthropic SSE 字节流，不做事件解析。"""
+    bytes_count = 0
+    stream_error: Optional[str] = None
+    try:
+        try:
+            async for chunk in response.aiter_bytes():
+                if chunk:
+                    bytes_count += len(chunk)
+                    yield chunk
+        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout, httpx.StreamError) as exc:
+            stream_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "[%s] anthropic passthrough | stream_aborted | bytes=%s | err=%s",
+                req_id, bytes_count, stream_error,
+            )
+    finally:
+        try:
+            await response.aclose()
+        except Exception as close_exc:
+            logger.debug("[%s] anthropic passthrough | aclose_error | %s", req_id, close_exc)
+        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        logger.info(
+            "[%s] anthropic passthrough | stream_closed | bytes=%s | duration_ms=%.0f | stream_error=%s",
+            req_id, bytes_count, elapsed_ms, stream_error,
+        )
 
-    req_id = uuid.uuid4().hex[:12]
-    client_host = request.client.host if request.client else "?"
+
+async def _handle_messages_anthropic_passthrough(
+    req_id: str,
+    provider_id: str,
+    upstream_model: Optional[str],
+    claude_body_dict: dict,
+    query_string: str = "",
+):
+    """provider 原生支持 Anthropic 协议 → 仅替换 model 字段，直接透传 body 与 query。"""
+    client = _get_client(provider_id, PROTOCOL_ANTHROPIC)
+    if client is None:
+        # 启动期已保证至少一个端点；理论上不会到这
+        return _protocol_unsupported_response(req_id, provider_id, PROTOCOL_ANTHROPIC)
+
+    if upstream_model is not None:
+        claude_body_dict["model"] = upstream_model
+
+    # Anthropic 协议端点路径为 /v1/messages（v1 是端点的一部分，按官方 SDK 约定，
+    # 不由 base_url 携带）。OpenAI 那边相反，v1 由 base_url 携带。
+    upstream_path = _append_query("v1/messages", query_string)
+    is_stream = bool(claude_body_dict.get("stream"))
     logger.info(
-        "[%s] client -> proxy | POST /v1/messages | remote=%s | ua=%r",
-        req_id,
-        client_host,
-        request.headers.get("user-agent", "")[:200],
+        "[%s] /v1/messages | provider=%r | mode=anthropic-passthrough | model=%r | stream=%s | upstream_path=%r",
+        req_id, provider_id, claude_body_dict.get("model"), is_stream, upstream_path,
+    )
+    logger.debug("[%s] proxy -> upstream | anthropic_request_json=%s", req_id, json_preview(claude_body_dict))
+
+    t0 = time.perf_counter()
+
+    if is_stream:
+        built = client.build_request("POST", upstream_path, json=claude_body_dict)
+        try:
+            r = await client.send(built, stream=True)
+        except httpx.RequestError as exc:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            logger.error(
+                "[%s] upstream | connection_failed | after_ms=%.0f | %s",
+                req_id, elapsed_ms, exc,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
+            raise HTTPException(status_code=502, detail="Upstream connection failed")
+
+        if r.status_code != 200:
+            body = await r.aread()
+            text = body.decode("utf-8", errors="replace")
+            logger.error(
+                "[%s] upstream | error | status=%s | preview=%r",
+                req_id, r.status_code, text[:2000],
+            )
+            try:
+                err_content = json.loads(text)
+            except json.JSONDecodeError:
+                err_content = {
+                    "type": "error",
+                    "error": {"type": "upstream_error", "message": text[:500]},
+                }
+            return JSONResponse(status_code=r.status_code, content=err_content)
+
+        return StreamingResponse(
+            _anthropic_stream_passthrough(r, req_id, t0),
+            media_type="text/event-stream",
+        )
+
+    # 非流式
+    try:
+        resp = await client.post(upstream_path, json=claude_body_dict)
+    except httpx.RequestError as exc:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        logger.error(
+            "[%s] upstream | connection_failed | after_ms=%.0f | %s",
+            req_id, elapsed_ms, exc,
+            exc_info=logger.isEnabledFor(logging.DEBUG),
+        )
+        raise HTTPException(status_code=502, detail="Upstream connection failed")
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    logger.info(
+        "[%s] upstream | anthropic passthrough | status=%s | duration_ms=%.0f",
+        req_id, resp.status_code, elapsed_ms,
     )
 
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > settings.MAX_BODY_SIZE:
-        logger.warning("[%s] reject | body too large (header) | %s bytes", req_id, content_length)
-        raise HTTPException(status_code=413, detail="Request entity too large")
+    if resp.status_code != 200:
+        try:
+            err_content = resp.json()
+        except Exception:
+            err_content = {
+                "type": "error",
+                "error": {"type": "upstream_error", "message": resp.text[:500]},
+            }
+        logger.error(
+            "[%s] upstream | error | status=%s | %s",
+            req_id, resp.status_code, json_preview(err_content),
+        )
+        return JSONResponse(status_code=resp.status_code, content=err_content)
 
     try:
-        body_bytes = await request.body()
-        if len(body_bytes) > settings.MAX_BODY_SIZE:
-            logger.warning("[%s] reject | body too large | %s bytes", req_id, len(body_bytes))
-            raise HTTPException(status_code=413, detail="Request entity too large")
+        data = resp.json()
+    except Exception as e:
+        logger.error(
+            "[%s] upstream | invalid_json_body | %s | preview=%r",
+            req_id, e, resp.text[:500],
+        )
+        raise HTTPException(status_code=502, detail="Upstream returned non-JSON body")
 
-        claude_body_dict = json.loads(body_bytes)
-    except json.JSONDecodeError:
-        logger.warning("[%s] reject | invalid JSON body", req_id)
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+    return JSONResponse(content=data)
 
+
+async def _handle_messages_openai_convert(
+    req_id: str,
+    provider_id: str,
+    upstream_model: Optional[str],
+    claude_body_dict: dict,
+):
+    """provider 仅支持 OpenAI 协议 → 走 claude→openai 转换 + openai→claude 反转。"""
+    client = _get_client(provider_id, PROTOCOL_OPENAI)
+    if client is None:
+        return _protocol_unsupported_response(req_id, provider_id, PROTOCOL_OPENAI)
+
+    # 这条分支需要严格 Claude schema 才能转换
     try:
         validated_req = ClaudeChatRequest(**claude_body_dict)
         claude_body = validated_req.model_dump(exclude_none=True)
@@ -206,20 +436,24 @@ async def handle_messages(request: Request):
         raise HTTPException(status_code=422, detail=f"Validation Error: {str(e)}")
 
     openai_req = claude_to_openai_request(claude_body)
-    openai_req["model"] = resolve_model_alias(openai_req.get("model"), req_id)
-    logger.info("[%s] proxy -> upstream | prepared | %s", req_id, summarize_openai_request(openai_req))
+    if upstream_model is not None:
+        openai_req["model"] = upstream_model
+
+    logger.info(
+        "[%s] /v1/messages | provider=%r | mode=openai-convert | %s",
+        req_id, provider_id, summarize_openai_request(openai_req),
+    )
     logger.debug("[%s] proxy -> upstream | openai_request_json=%s", req_id, json_preview(openai_req))
 
     if openai_req.get("stream", False):
-        built = http_client.build_request("POST", "chat/completions", json=openai_req)
+        built = client.build_request("POST", "chat/completions", json=openai_req)
         logger.info(
-            "[%s] proxy -> upstream | POST %schat/completions | stream=true",
-            req_id,
-            settings.OPENAI_API_BASE,
+            "[%s] proxy -> upstream | POST %schat/completions | provider=%r | model=%r | stream=true",
+            req_id, client.base_url, provider_id, openai_req.get("model"),
         )
         t0 = time.perf_counter()
         try:
-            r = await http_client.send(built, stream=True)
+            r = await client.send(built, stream=True)
         except httpx.RequestError as exc:
             elapsed_ms = (time.perf_counter() - t0) * 1000
             logger.error(
@@ -271,13 +505,12 @@ async def handle_messages(request: Request):
         )
 
     logger.info(
-        "[%s] proxy -> upstream | POST %schat/completions | stream=false",
-        req_id,
-        settings.OPENAI_API_BASE,
+        "[%s] proxy -> upstream | POST %schat/completions | provider=%r | model=%r | stream=false",
+        req_id, client.base_url, provider_id, openai_req.get("model"),
     )
     t0 = time.perf_counter()
     try:
-        resp = await http_client.post("chat/completions", json=openai_req)
+        resp = await client.post("chat/completions", json=openai_req)
     except httpx.RequestError as exc:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         logger.error(
@@ -332,6 +565,59 @@ async def handle_messages(request: Request):
     logger.debug("[%s] upstream | response_body=%s", req_id, json_preview(data))
 
     return JSONResponse(content=openai_to_claude_response(data))
+
+
+@app.post("/v1/messages")
+async def handle_messages(request: Request):
+    if not http_clients:
+        logger.error("Server not initialized properly")
+        raise HTTPException(status_code=500, detail="Server not initialized properly")
+
+    req_id = uuid.uuid4().hex[:12]
+    client_host = request.client.host if request.client else "?"
+    logger.info(
+        "[%s] client -> proxy | POST /v1/messages | remote=%s | ua=%r",
+        req_id,
+        client_host,
+        request.headers.get("user-agent", "")[:200],
+    )
+
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > settings.MAX_BODY_SIZE:
+        logger.warning("[%s] reject | body too large (header) | %s bytes", req_id, content_length)
+        raise HTTPException(status_code=413, detail="Request entity too large")
+
+    try:
+        body_bytes = await request.body()
+        if len(body_bytes) > settings.MAX_BODY_SIZE:
+            logger.warning("[%s] reject | body too large | %s bytes", req_id, len(body_bytes))
+            raise HTTPException(status_code=413, detail="Request entity too large")
+
+        claude_body_dict = json.loads(body_bytes)
+    except json.JSONDecodeError:
+        logger.warning("[%s] reject | invalid JSON body", req_id)
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    if not isinstance(claude_body_dict, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    provider_id, upstream_model = resolve_model_route(claude_body_dict.get("model"), req_id)
+    provider = settings.PROVIDERS.get(provider_id)
+    if provider is None:
+        logger.error("[%s] provider not initialized: %r", req_id, provider_id)
+        raise HTTPException(status_code=500, detail=f"Provider {provider_id!r} not configured")
+
+    # 优先用 provider 原生 Anthropic 端点透传；否则走 OpenAI 转换路径
+    if provider.anthropic is not None:
+        return await _handle_messages_anthropic_passthrough(
+            req_id, provider_id, upstream_model, claude_body_dict,
+            query_string=request.url.query,
+        )
+    # openai-convert 分支不透传 query：原 Anthropic 协议的 query（如 ?beta=true）
+    # 对 OpenAI 上游没意义，强行带上反而可能引起 400。
+    return await _handle_messages_openai_convert(
+        req_id, provider_id, upstream_model, claude_body_dict,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +687,7 @@ async def _openai_stream_passthrough(response: httpx.Response, req_id: str, t_st
 
 @app.post("/v1/chat/completions")
 async def handle_chat_completions(request: Request):
-    if http_client is None:
+    if not http_clients:
         logger.error("Server not initialized properly")
         raise HTTPException(status_code=500, detail="Server not initialized properly")
 
@@ -427,23 +713,34 @@ async def handle_chat_completions(request: Request):
         logger.warning("[%s] reject | invalid JSON body", req_id)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    if isinstance(openai_req, dict) and openai_req.get("model"):
-        openai_req["model"] = resolve_model_alias(openai_req["model"], req_id)
+    client_model = openai_req.get("model") if isinstance(openai_req, dict) else None
+    provider_id, upstream_model = resolve_model_route(client_model, req_id)
+    if isinstance(openai_req, dict) and upstream_model is not None:
+        openai_req["model"] = upstream_model
 
-    logger.info("[%s] proxy -> upstream | prepared | %s", req_id, summarize_openai_request(openai_req))
+    client = _get_client(provider_id, PROTOCOL_OPENAI)
+    if client is None:
+        return _protocol_unsupported_response(req_id, provider_id, PROTOCOL_OPENAI)
+
+    upstream_path = _append_query("chat/completions", request.url.query)
+
+    logger.info(
+        "[%s] proxy -> upstream | provider=%r | upstream_path=%r | %s",
+        req_id, provider_id, upstream_path, summarize_openai_request(openai_req),
+    )
     logger.debug("[%s] proxy -> upstream | openai_request_json=%s", req_id, json_preview(openai_req))
 
     is_stream = openai_req.get("stream", False)
 
     if is_stream:
-        built = http_client.build_request("POST", "chat/completions", json=openai_req)
+        built = client.build_request("POST", upstream_path, json=openai_req)
         logger.info(
-            "[%s] proxy -> upstream | POST %schat/completions | stream=true (passthrough)",
-            req_id, settings.OPENAI_API_BASE,
+            "[%s] proxy -> upstream | POST %s%s | provider=%r | model=%r | stream=true (passthrough)",
+            req_id, client.base_url, upstream_path, provider_id, openai_req.get("model"),
         )
         t0 = time.perf_counter()
         try:
-            r = await http_client.send(built, stream=True)
+            r = await client.send(built, stream=True)
         except httpx.RequestError as exc:
             elapsed_ms = (time.perf_counter() - t0) * 1000
             logger.error(
@@ -470,12 +767,12 @@ async def handle_chat_completions(request: Request):
 
     # 非流式
     logger.info(
-        "[%s] proxy -> upstream | POST %schat/completions | stream=false (passthrough)",
-        req_id, settings.OPENAI_API_BASE,
+        "[%s] proxy -> upstream | POST %s%s | provider=%r | model=%r | stream=false (passthrough)",
+        req_id, client.base_url, upstream_path, provider_id, openai_req.get("model"),
     )
     t0 = time.perf_counter()
     try:
-        resp = await http_client.post("chat/completions", json=openai_req)
+        resp = await client.post(upstream_path, json=openai_req)
     except httpx.RequestError as exc:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         logger.error(
@@ -515,15 +812,23 @@ async def handle_chat_completions(request: Request):
 
 @app.get("/v1/models")
 async def handle_list_models(request: Request):
-    if http_client is None:
+    if not http_clients:
         raise HTTPException(status_code=500, detail="Server not initialized properly")
 
     req_id = uuid.uuid4().hex[:12]
-    logger.info("[%s] client -> proxy | GET /v1/models", req_id)
+    provider_id = settings.DEFAULT_PROVIDER_ID
+    client = _get_client(provider_id, PROTOCOL_OPENAI)
+    if client is None:
+        return _protocol_unsupported_response(req_id, provider_id, PROTOCOL_OPENAI)
+    upstream_path = _append_query("models", request.url.query)
+    logger.info(
+        "[%s] client -> proxy | GET /v1/models | provider=%r | upstream_path=%r",
+        req_id, provider_id, upstream_path,
+    )
 
     t0 = time.perf_counter()
     try:
-        resp = await http_client.get("models")
+        resp = await client.get(upstream_path)
     except httpx.RequestError as exc:
         elapsed_ms = (time.perf_counter() - t0) * 1000
         logger.error("[%s] upstream | connection_failed | after_ms=%.0f | %s", req_id, elapsed_ms, exc)

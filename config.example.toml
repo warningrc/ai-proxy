@@ -1,0 +1,155 @@
+# =============================================================================
+# ai-proxy 配置示例。请复制为 config.toml 后按需修改：
+#     cp config.example.toml config.toml
+# =============================================================================
+
+# 日志级别：INFO（默认）| DEBUG。DEBUG 会打印每条上游 SSE 分片，流式时日志量大。
+log_level = "INFO"
+
+# 请求体大小上限（字节）。
+max_body_size = 15728640
+
+# 未命中 model_routes 时使用的默认 provider。
+# 不声明时取下方 providers 数组的第一个。
+default_provider = "openai-only"
+
+
+# -----------------------------------------------------------------------------
+# 超时配置（秒）
+# -----------------------------------------------------------------------------
+[timeouts]
+connect = 5.0
+read    = 300.0
+write   = 20.0
+pool    = 10.0
+
+
+# =============================================================================
+# 上游服务商
+#
+# 每个 [[providers]] 至少要声明一个协议子表（[providers.openai] 或
+# [providers.anthropic]）；存在哪个子表，就代表该 provider 原生支持该协议。
+#
+# 顶层字段：
+#   - id      : 必填，唯一标识
+#   - api_key : 可选；作为各协议子表的共享默认 key。
+#               大部分三方服务两个协议用同一个 Key，写在这里就够了；
+#               若个别协议需要单独 Key，在子表里再写 api_key 即可覆盖。
+#
+# 协议子表字段（[providers.openai] / [providers.anthropic]）：
+#   - base_url   : 必填，协议根路径（末尾 / 可省略）
+#                  ★ 注意两个协议的 base_url 约定不同：
+#                    * OpenAI    -> base_url 包含 /v1，代码拼  "chat/completions"
+#                                   例：https://api.openai.com/v1
+#                    * Anthropic -> base_url 不含 /v1，代码拼  "v1/messages"
+#                                   例：https://api.anthropic.com
+#                  这是各自 SDK 的事实约定，混着写会导致路径出现 /v1/v1。
+#   - api_key    : 可选；不填则继承顶层共享值；两处都没有则启动报错
+#   - auth_style : 可选，鉴权风格；缺省按协议默认
+#                  允许值：
+#                    "bearer"    -> Authorization: Bearer <api_key>
+#                    "anthropic" -> x-api-key + anthropic-version: 2023-06-01
+#                    "none"      -> 不注入默认鉴权头（自行用 headers 处理）
+#                  默认值：openai 子表 = "bearer"；anthropic 子表 = "anthropic"
+#   - headers    : 可选，附加/覆盖请求头（最高优先级，可逐个 header 覆盖默认值）
+#
+# 提示：某些厂商（如火山方舟）的 Anthropic 兼容端点要求 Bearer 鉴权而非
+# Anthropic 官方的 x-api-key。这种情况下显式声明 auth_style = "bearer" 即可。
+# =============================================================================
+
+# 仅支持 OpenAI 协议（最常见的兼容服务）
+[[providers]]
+id      = "openai-only"
+api_key = "sk-replace-me"
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+# api_key 继承顶层
+# headers = { "X-Custom-Header" = "foo" }
+
+
+# 同时支持 OpenAI 与 Anthropic 协议、共用同一个 Key（最常见的写法）
+[[providers]]
+id      = "dual-shared-key"
+api_key = "sk-vendor-xxx"          # 两个协议共享
+
+[providers.openai]
+base_url = "https://api.example.com/openai/v1"
+
+[providers.anthropic]
+# 注意 base_url 不要带 /v1，代码会自动拼 v1/messages
+base_url = "https://api.example.com/anthropic"
+
+
+# 两个协议端点要求各自独立的 Key（少数情况，比如 Anthropic 官方）
+[[providers]]
+id = "dual-separate-keys"
+
+[providers.openai]
+base_url = "https://api.example.com/openai/v1"
+api_key  = "sk-openai-xxx"
+
+[providers.anthropic]
+base_url = "https://api.example.com/anthropic"
+api_key  = "sk-ant-yyy"
+# headers = { "x-api-key" = "override-if-needed" }
+
+
+# 仅支持 Anthropic 协议
+[[providers]]
+id = "anthropic-only"
+
+[providers.anthropic]
+# Anthropic 官方域名直接到根；v1 由代码拼上
+base_url = "https://api.anthropic.com"
+api_key  = "sk-ant-xxxxx"
+
+
+# 火山方舟 Ark：OpenAI 与 Anthropic 兼容端点都用 Bearer 鉴权
+# 需要在 anthropic 子表显式声明 auth_style = "bearer"
+#
+# 注意：Ark 的 Anthropic 兼容根路径要按你方实际可用的为准。代码会在 base_url
+# 后面固定拼 v1/messages，所以这里 base_url 不要带 /v1（也不要带末尾 /messages）。
+# 客户端带的 query（如 ?beta=true）会原样透传。
+[[providers]]
+id      = "volcengine"
+api_key = "your-volcengine-api-key"
+
+[providers.openai]
+base_url = "https://ark.cn-beijing.volces.com/api/v3"
+
+[providers.anthropic]
+# 例：Ark 计划路径 .../api/plan/v1/messages?beta=true
+# 这里就写到 plan 一级，"v1/messages" 由代码拼
+base_url   = "https://ark.cn-beijing.volces.com/api/plan"
+auth_style = "bearer"
+
+
+# =============================================================================
+# 模型路由：客户端模型名 -> { provider, 上游真实模型名 }
+#
+# 路由只决定「打到哪个 provider」和「上游模型名」。
+# 「走哪种协议」由入口接口决定：
+#   - POST /v1/messages         -> 如果 provider 有 anthropic 端点，直接透传；
+#                                  否则走 claude → openai 转换。
+#   - POST /v1/chat/completions -> provider 必须有 openai 端点，否则 502。
+#
+# value 形式：
+#   1) inline 表（当前唯一使用的形式）：
+#        "claude-3-5-sonnet-20241022" = { provider = "openai-only", model = "gpt-4o" }
+#   2) 数组表（未来 failover 预留，当前只使用 list[0] 并 WARN）：
+#        [[model_routes."claude-failover"]]
+#        provider = "openai-only"
+#        model    = "gpt-4o"
+#        [[model_routes."claude-failover"]]
+#        provider = "dual-protocol"
+#        model    = "gpt-4o"
+#
+# model 字段可省略，省略时透传客户端传入的模型名。
+# 未命中路由的模型 → 走 default_provider，模型名原样透传。
+# =============================================================================
+[model_routes]
+"claude-3-5-sonnet-20241022" = { provider = "openai-only",   model = "gpt-4o" }
+"claude-3-5-haiku-20241022"  = { provider = "openai-only",   model = "gpt-4o-mini" }
+"deepseek-chat"              = { provider = "dual-protocol" }
+"claude-native"              = { provider = "anthropic-only", model = "claude-3-5-sonnet-20241022" }

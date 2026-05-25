@@ -8,8 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
-.env
 .idea/
+
+# Local config (contains secrets)
+config.toml
 
 # Logs
 logs/

@@ -1,89 +1,365 @@
-import json
+"""
+配置加载：只读 config.toml。
+
+设计原则：
+- 单一事实源：所有配置都来自 TOML 文件，**不支持环境变量覆盖配置值**。
+- 唯一的外部输入是文件路径：默认 ``./config.toml``，可通过 ``CONFIG_FILE``
+  环境变量指定其他路径（这只是"去哪儿读文件"，不构成对配置内容的覆盖）。
+- 严格校验，配置错误一律 fail-fast 退出，避免运行时再炸。
+"""
+
+from __future__ import annotations
+
 import os
 import sys
-from typing import Dict
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from dotenv import load_dotenv
 
-load_dotenv()
+# ---------------------------------------------------------------------------
+#  常量
+# ---------------------------------------------------------------------------
+
+PROTOCOL_OPENAI = "openai"
+PROTOCOL_ANTHROPIC = "anthropic"
+PROTOCOLS = (PROTOCOL_OPENAI, PROTOCOL_ANTHROPIC)
+
+# 鉴权风格
+AUTH_STYLE_BEARER = "bearer"        # Authorization: Bearer <api_key>
+AUTH_STYLE_ANTHROPIC = "anthropic"  # x-api-key + anthropic-version
+AUTH_STYLE_NONE = "none"            # 不注入默认鉴权头（由 headers 子表自行处理）
+AUTH_STYLES = (AUTH_STYLE_BEARER, AUTH_STYLE_ANTHROPIC, AUTH_STYLE_NONE)
+
+# 协议默认 auth_style（厂商若不一致，可在子表 auth_style 字段覆盖）
+DEFAULT_AUTH_STYLE_BY_PROTOCOL = {
+    PROTOCOL_OPENAI: AUTH_STYLE_BEARER,
+    PROTOCOL_ANTHROPIC: AUTH_STYLE_ANTHROPIC,
+}
 
 
-def _parse_model_aliases(raw: str | None) -> Dict[str, str]:
+# ---------------------------------------------------------------------------
+#  数据结构
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProviderEndpoint:
+    """一个 provider 在特定协议下的连接信息。"""
+    base_url: str
+    api_key: str
+    # 鉴权风格：决定默认注入哪些鉴权头。
+    # - "bearer"    -> Authorization: Bearer <api_key>
+    # - "anthropic" -> x-api-key: <api_key> + anthropic-version: 2023-06-01
+    # - "none"      -> 不注入默认鉴权头（自行用 headers 子表处理）
+    auth_style: str = AUTH_STYLE_BEARER
+    headers: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class ProviderConfig:
     """
-    解析 MODEL_ALIASES 环境变量为 {client_model: upstream_model} 字典。
+    一个上游服务商。
 
-    支持两种格式：
-    1. JSON 对象：{"claude-3-5-sonnet": "gpt-4o", "claude-3-haiku": "gpt-4o-mini"}
-    2. 逗号分隔的键值对：claude-3-5-sonnet=gpt-4o,claude-3-haiku=gpt-4o-mini
-
-    任意解析失败都会打印警告并返回空字典，确保服务能正常启动（无映射即透传）。
+    每个 provider 可以同时支持多种协议；至少声明一个端点。
+    某个协议字段为 None 表示该 provider 不原生支持该协议。
     """
-    if not raw or not raw.strip():
+    id: str
+    openai: Optional[ProviderEndpoint] = None
+    anthropic: Optional[ProviderEndpoint] = None
+
+    def endpoint(self, protocol: str) -> Optional[ProviderEndpoint]:
+        if protocol == PROTOCOL_OPENAI:
+            return self.openai
+        if protocol == PROTOCOL_ANTHROPIC:
+            return self.anthropic
+        return None
+
+    def supported_protocols(self) -> List[str]:
+        return [p for p in PROTOCOLS if self.endpoint(p) is not None]
+
+
+@dataclass
+class ModelRoute:
+    """一条模型路由。upstream_model 为空表示透传客户端模型名。"""
+    provider_id: str
+    upstream_model: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+#  辅助
+# ---------------------------------------------------------------------------
+
+def _die(msg: str) -> "NoReturn":  # type: ignore[name-defined]
+    print(f"CRITICAL ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _ensure_trailing_slash(url: str) -> str:
+    return url if url.endswith("/") else url + "/"
+
+
+# 顶层 provider 表里若出现这些字段，属于旧 schema 残留，明确拒绝：
+# - base_url：OpenAI / Anthropic 协议根路径天然不同，不能共享；必须各自写在协议子表里
+# - headers ：当前未支持顶层共享头；如有共享需求请显式写在各协议子表
+# 注意：api_key **不在此列**——顶层 api_key 是合法的"共享默认值"，子表存在则覆盖。
+_LEGACY_PROVIDER_FIELDS = ("base_url", "headers")
+
+
+# ---------------------------------------------------------------------------
+#  TOML 解析
+# ---------------------------------------------------------------------------
+
+def _load_toml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        _die(
+            f"配置文件不存在: {path}\n"
+            f"  请在项目根创建 config.toml（参考 config.example.toml），\n"
+            f"  或通过 CONFIG_FILE 环境变量指定路径。"
+        )
+    try:
+        with path.open("rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        _die(f"配置文件 TOML 解析失败: {path}\n  {e}")
+    except OSError as e:
+        _die(f"配置文件读取失败: {path}\n  {e}")
+
+
+def _parse_endpoint(
+    raw: Any,
+    provider_id: str,
+    protocol: str,
+    shared_api_key: Optional[str],
+) -> ProviderEndpoint:
+    """
+    解析单个协议子表。
+
+    api_key 的取值顺序：
+      1. 子表 ``api_key`` 字段（如果存在且非空，覆盖共享默认）
+      2. provider 顶层共享的 ``shared_api_key``
+    两处都没有则 fail-fast。
+    """
+    if not isinstance(raw, dict):
+        _die(
+            f"providers[{provider_id!r}].{protocol} 必须是表，"
+            f"实际为 {type(raw).__name__}"
+        )
+
+    base = str(raw.get("base_url", "")).strip()
+    if not base:
+        _die(f"providers[{provider_id!r}].{protocol} 缺少 base_url")
+
+    sub_key = str(raw.get("api_key", "")).strip()
+    key = sub_key or (shared_api_key or "")
+    if not key:
+        _die(
+            f"providers[{provider_id!r}].{protocol} 缺少 api_key"
+            f"（子表与 provider 顶层均未提供）"
+        )
+
+    auth_style_raw = raw.get("auth_style")
+    if auth_style_raw is None:
+        auth_style = DEFAULT_AUTH_STYLE_BY_PROTOCOL[protocol]
+    else:
+        if not isinstance(auth_style_raw, str):
+            _die(
+                f"providers[{provider_id!r}].{protocol}.auth_style 必须是字符串"
+            )
+        auth_style = auth_style_raw.strip().lower()
+        if auth_style not in AUTH_STYLES:
+            _die(
+                f"providers[{provider_id!r}].{protocol}.auth_style={auth_style_raw!r} 非法，"
+                f"允许值: {list(AUTH_STYLES)}"
+            )
+
+    headers = raw.get("headers", {}) or {}
+    if not isinstance(headers, dict):
+        _die(
+            f"providers[{provider_id!r}].{protocol}.headers 必须是表（key/value 字符串）"
+        )
+
+    return ProviderEndpoint(
+        base_url=_ensure_trailing_slash(base),
+        api_key=key,
+        auth_style=auth_style,
+        headers={str(k): str(v) for k, v in headers.items()},
+    )
+
+
+def _parse_providers(raw: Any) -> List[ProviderConfig]:
+    if not raw:
+        _die("配置缺少 [[providers]]：至少需要声明一个上游服务商。")
+    if not isinstance(raw, list):
+        _die("配置 providers 必须是数组（请使用 [[providers]] 数组表）。")
+
+    seen_ids: set[str] = set()
+    providers: List[ProviderConfig] = []
+
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            _die(f"providers[{i}] 必须是表（table），实际为 {type(item).__name__}")
+
+        pid = str(item.get("id", "")).strip()
+        if not pid:
+            _die(f"providers[{i}] 缺少 id")
+        if pid in seen_ids:
+            _die(f"providers 中存在重复 id: {pid!r}")
+        seen_ids.add(pid)
+
+        # 顶层不允许 base_url / headers（含义不可共享或当前未支持）
+        legacy_hits = [f for f in _LEGACY_PROVIDER_FIELDS if f in item]
+        if legacy_hits:
+            _die(
+                f"providers[{pid!r}] 顶层不允许字段 {legacy_hits}：\n"
+                f"  - base_url：两个协议根路径不同，请写在 [providers.openai] / [providers.anthropic] 各自的子表里。\n"
+                f"  - headers ：暂不支持顶层共享，请写在各协议子表里。\n"
+                f"  详见 config.example.toml。"
+            )
+
+        # 顶层 api_key 作为共享默认值（可选）；任一协议子表里的 api_key 会覆盖它。
+        shared_api_key = str(item.get("api_key", "")).strip() or None
+
+        openai_ep = (
+            _parse_endpoint(item["openai"], pid, PROTOCOL_OPENAI, shared_api_key)
+            if "openai" in item else None
+        )
+        anthropic_ep = (
+            _parse_endpoint(item["anthropic"], pid, PROTOCOL_ANTHROPIC, shared_api_key)
+            if "anthropic" in item else None
+        )
+
+        if openai_ep is None and anthropic_ep is None:
+            _die(
+                f"providers[{pid!r}] 至少需要声明一个协议子表："
+                f"[providers.openai] 或 [providers.anthropic]"
+            )
+
+        providers.append(ProviderConfig(
+            id=pid,
+            openai=openai_ep,
+            anthropic=anthropic_ep,
+        ))
+
+    return providers
+
+
+def _parse_model_routes(
+    raw: Any,
+    known_provider_ids: set[str],
+) -> Dict[str, List[ModelRoute]]:
+    """
+    解析 [model_routes] 段，value 接受两种形式：
+
+    1. inline 表：{ provider = "p", model = "m" }     -> 单条路由（当前唯一使用）
+    2. 数组表  ：[[model_routes."x"]] ...              -> 多条路由（未来 failover 预留）
+
+    model 字段可省略，省略时透传客户端模型名。
+    """
+    if not raw:
         return {}
+    if not isinstance(raw, dict):
+        _die("model_routes 必须是表（[model_routes] 段）")
 
-    raw = raw.strip()
+    result: Dict[str, List[ModelRoute]] = {}
+    for client_model, value in raw.items():
+        if not isinstance(client_model, str) or not client_model.strip():
+            _die(f"model_routes 存在无效 key: {client_model!r}")
+        client_model = client_model.strip()
 
-    if raw.startswith("{"):
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            print(f"WARNING: MODEL_ALIASES JSON 解析失败，将忽略别名映射: {e}")
-            return {}
-        if not isinstance(data, dict):
-            print("WARNING: MODEL_ALIASES 必须是 JSON 对象，将忽略别名映射")
-            return {}
-        result: Dict[str, str] = {}
-        for k, v in data.items():
-            if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
-                result[k.strip()] = v.strip()
-            else:
-                print(f"WARNING: MODEL_ALIASES 跳过无效条目: {k!r} -> {v!r}")
-        return result
+        items = value if isinstance(value, list) else [value]
+        routes: List[ModelRoute] = []
+        for j, entry in enumerate(items):
+            if not isinstance(entry, dict):
+                _die(
+                    f"model_routes[{client_model!r}][{j}] 必须是表，"
+                    f"实际为 {type(entry).__name__}"
+                )
 
-    result = {}
-    for pair in raw.split(","):
-        pair = pair.strip()
-        if not pair:
-            continue
-        if "=" not in pair:
-            print(f"WARNING: MODEL_ALIASES 跳过无效条目（缺少 '='）: {pair!r}")
-            continue
-        k, v = pair.split("=", 1)
-        k, v = k.strip(), v.strip()
-        if k and v:
-            result[k] = v
-        else:
-            print(f"WARNING: MODEL_ALIASES 跳过空键或空值: {pair!r}")
+            pid = str(entry.get("provider", "")).strip()
+            if not pid:
+                _die(f"model_routes[{client_model!r}][{j}] 缺少 provider")
+            if pid not in known_provider_ids:
+                _die(
+                    f"model_routes[{client_model!r}][{j}] 指向未知 provider={pid!r}"
+                    f"（已知: {sorted(known_provider_ids)}）"
+                )
+
+            upstream_model = entry.get("model")
+            if upstream_model is not None:
+                if not isinstance(upstream_model, str) or not upstream_model.strip():
+                    _die(
+                        f"model_routes[{client_model!r}][{j}].model 必须是非空字符串或省略"
+                    )
+                upstream_model = upstream_model.strip()
+
+            routes.append(ModelRoute(provider_id=pid, upstream_model=upstream_model))
+
+        if routes:
+            result[client_model] = routes
     return result
 
 
+# ---------------------------------------------------------------------------
+#  Settings
+# ---------------------------------------------------------------------------
+
+CONFIG_FILE_ENV = "CONFIG_FILE"
+DEFAULT_CONFIG_PATH = "config.toml"
+
+
 class Settings:
-    OPENAI_API_BASE: str
-    OPENAI_API_KEY: str
-    MODEL_ALIASES: Dict[str, str]
+    PROVIDERS: Dict[str, ProviderConfig]
+    DEFAULT_PROVIDER_ID: str
+    MODEL_ROUTES: Dict[str, List[ModelRoute]]
+
+    LOG_LEVEL: str
+    MAX_BODY_SIZE: int
+    TIMEOUT_CONNECT: float
+    TIMEOUT_READ: float
+    TIMEOUT_WRITE: float
+    TIMEOUT_POOL: float
+
+    CONFIG_PATH: Path
 
     def __init__(self):
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key or not api_key.strip():
-            print("CRITICAL ERROR: OPENAI_API_KEY is missing or empty in environment variables.")
-            print("Please set OPENAI_API_KEY in your .env file or environment.")
-            sys.exit(1)
-        self.OPENAI_API_KEY = api_key
+        path = Path(os.getenv(CONFIG_FILE_ENV, DEFAULT_CONFIG_PATH)).expanduser()
+        self.CONFIG_PATH = path
 
-        self.OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
-        if not self.OPENAI_API_BASE.endswith("/"):
-            self.OPENAI_API_BASE += "/"
+        data = _load_toml(path)
 
-        self.TIMEOUT_CONNECT = float(os.getenv("TIMEOUT_CONNECT", "5.0"))
-        self.TIMEOUT_READ = float(os.getenv("TIMEOUT_READ", "300.0"))
-        self.TIMEOUT_WRITE = float(os.getenv("TIMEOUT_WRITE", "20.0"))
-        self.TIMEOUT_POOL = float(os.getenv("TIMEOUT_POOL", "10.0"))
+        # --- 1. providers ---
+        providers_list = _parse_providers(data.get("providers"))
+        self.PROVIDERS = {p.id: p for p in providers_list}
 
-        self.MAX_BODY_SIZE = int(os.getenv("MAX_BODY_SIZE", "15728640"))
+        # --- 2. default_provider ---
+        default = str(data.get("default_provider", "")).strip()
+        if not default:
+            default = providers_list[0].id
+        elif default not in self.PROVIDERS:
+            _die(
+                f"default_provider={default!r} 不在 providers 中"
+                f"（已知: {sorted(self.PROVIDERS)}）"
+            )
+        self.DEFAULT_PROVIDER_ID = default
 
-        self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+        # --- 3. model_routes ---
+        self.MODEL_ROUTES = _parse_model_routes(
+            data.get("model_routes"),
+            known_provider_ids=set(self.PROVIDERS),
+        )
 
-        self.MODEL_ALIASES = _parse_model_aliases(os.getenv("MODEL_ALIASES"))
+        # --- 4. 其他全局参数 ---
+        self.LOG_LEVEL = str(data.get("log_level", "INFO")).upper()
+        self.MAX_BODY_SIZE = int(data.get("max_body_size", 15728640))
+
+        timeouts = data.get("timeouts", {}) or {}
+        if not isinstance(timeouts, dict):
+            _die("timeouts 必须是表（[timeouts] 段）")
+        self.TIMEOUT_CONNECT = float(timeouts.get("connect", 5.0))
+        self.TIMEOUT_READ = float(timeouts.get("read", 300.0))
+        self.TIMEOUT_WRITE = float(timeouts.get("write", 20.0))
+        self.TIMEOUT_POOL = float(timeouts.get("pool", 10.0))
 
 
 settings = Settings()
