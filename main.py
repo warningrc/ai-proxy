@@ -145,8 +145,18 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-def _extract_tenant(request: Request, req_id: str) -> str:
-    """从请求头提取 Bearer key 或 x-api-key，匹配租户。"""
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _authenticate_request(request: Request, req_id: str) -> str:
+    """从请求头提取 Bearer key 或 x-api-key，匹配并校验租户身份。"""
     raw_key: Optional[str] = None
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
@@ -154,9 +164,18 @@ def _extract_tenant(request: Request, req_id: str) -> str:
     if not raw_key:
         raw_key = request.headers.get("x-api-key", "").strip() or None
 
+    if not raw_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication credentials were not provided."
+        )
+
     tenant_id = usage_stats.resolve_tenant(raw_key)
-    if tenant_id != "default" and raw_key:
-        logger.debug("[%s] tenant=%r (key=%s)", req_id, tenant_id, _mask_key(raw_key))
+    if tenant_id == "default":
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API Key."
+        )
     return tenant_id
 
 
@@ -252,6 +271,8 @@ def _check_tenant_allowance(tenant_id: str) -> None:
 def _record_anthropic_usage(
     req_id: str, tenant_id: str, provider_id: str,
     model: str, duration_ms: float, data: dict,
+    prompt: Optional[str] = None, status_code: int = 200,
+    client_ip: Optional[str] = None,
 ) -> None:
     """从 Anthropic 非流式响应中提取 usage 并记录。"""
     u = data.get("usage") or {}
@@ -266,12 +287,17 @@ def _record_anthropic_usage(
         cache_read_tokens=u.get("cache_read_input_tokens", 0),
         cache_creation_tokens=u.get("cache_creation_input_tokens", 0),
         duration_ms=duration_ms,
+        prompt=prompt,
+        status_code=status_code,
+        client_ip=client_ip,
     ))
 
 
 def _record_openai_usage(
     req_id: str, tenant_id: str, provider_id: str,
     model: str, endpoint: str, duration_ms: float, data: dict,
+    prompt: Optional[str] = None, status_code: int = 200,
+    client_ip: Optional[str] = None,
 ) -> None:
     """从 OpenAI 非流式响应中提取 usage 并记录。"""
     u = data.get("usage") or {}
@@ -292,6 +318,9 @@ def _record_openai_usage(
         cache_read_tokens=cache_read,
         cache_creation_tokens=0,
         duration_ms=duration_ms,
+        prompt=prompt,
+        status_code=status_code,
+        client_ip=client_ip,
     ))
 
 
@@ -389,6 +418,7 @@ async def stream_generator(response: httpx.Response, req_id: str, t_upstream_sta
 async def _anthropic_stream_passthrough(
     response: httpx.Response, req_id: str, t_start: float,
     tenant_id: str = "default", provider_id: str = "", model: str = "",
+    prompt_str: Optional[str] = None, client_ip: Optional[str] = None,
 ):
     """转发 Anthropic SSE 流，同时解析 usage 事件用于统计。"""
     bytes_count = 0
@@ -454,6 +484,9 @@ async def _anthropic_stream_passthrough(
             cache_read_tokens=cache_read_tokens,
             cache_creation_tokens=cache_creation_tokens,
             duration_ms=elapsed_ms,
+            prompt=prompt_str,
+            status_code=200,
+            client_ip=client_ip,
         ))
 
 
@@ -464,11 +497,18 @@ async def _handle_messages_anthropic_passthrough(
     claude_body_dict: dict,
     query_string: str = "",
     tenant_id: str = "default",
+    prompt_str: Optional[str] = None,
+    client_ip: Optional[str] = None,
 ):
     """provider 原生支持 Anthropic 协议 → 仅替换 model 字段，直接透传 body 与 query。"""
     client = _get_client(provider_id, PROTOCOL_ANTHROPIC)
     if client is None:
         # 启动期已保证至少一个端点；理论上不会到这
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+            model=claude_body_dict.get("model", ""), endpoint="messages",
+            prompt=prompt_str, status_code=502, client_ip=client_ip,
+        ))
         return _protocol_unsupported_response(req_id, provider_id, PROTOCOL_ANTHROPIC)
 
     if upstream_model is not None:
@@ -497,6 +537,12 @@ async def _handle_messages_anthropic_passthrough(
                 req_id, elapsed_ms, exc,
                 exc_info=logger.isEnabledFor(logging.DEBUG),
             )
+            record_usage_async(UsageRecord(
+                req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+                model=claude_body_dict.get("model", ""), endpoint="messages",
+                prompt=prompt_str, status_code=502, client_ip=client_ip,
+                duration_ms=elapsed_ms
+            ))
             raise HTTPException(status_code=502, detail="Upstream connection failed")
 
         if r.status_code != 200:
@@ -513,6 +559,12 @@ async def _handle_messages_anthropic_passthrough(
                     "type": "error",
                     "error": {"type": "upstream_error", "message": text[:500]},
                 }
+            record_usage_async(UsageRecord(
+                req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+                model=claude_body_dict.get("model", ""), endpoint="messages",
+                prompt=prompt_str, status_code=r.status_code, client_ip=client_ip,
+                duration_ms=(time.perf_counter() - t0) * 1000
+            ))
             return JSONResponse(status_code=r.status_code, content=err_content)
 
         return StreamingResponse(
@@ -520,6 +572,7 @@ async def _handle_messages_anthropic_passthrough(
                 r, req_id, t0,
                 tenant_id=tenant_id, provider_id=provider_id,
                 model=claude_body_dict.get("model", ""),
+                prompt_str=prompt_str, client_ip=client_ip,
             ),
             media_type="text/event-stream",
         )
@@ -534,6 +587,12 @@ async def _handle_messages_anthropic_passthrough(
             req_id, elapsed_ms, exc,
             exc_info=logger.isEnabledFor(logging.DEBUG),
         )
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+            model=claude_body_dict.get("model", ""), endpoint="messages",
+            prompt=prompt_str, status_code=502, client_ip=client_ip,
+            duration_ms=elapsed_ms
+        ))
         raise HTTPException(status_code=502, detail="Upstream connection failed")
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -554,6 +613,12 @@ async def _handle_messages_anthropic_passthrough(
             "[%s] upstream | error | status=%s | %s",
             req_id, resp.status_code, json_preview(err_content),
         )
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+            model=claude_body_dict.get("model", ""), endpoint="messages",
+            prompt=prompt_str, status_code=resp.status_code, client_ip=client_ip,
+            duration_ms=elapsed_ms
+        ))
         return JSONResponse(status_code=resp.status_code, content=err_content)
 
     try:
@@ -563,10 +628,17 @@ async def _handle_messages_anthropic_passthrough(
             "[%s] upstream | invalid_json_body | %s | preview=%r",
             req_id, e, resp.text[:500],
         )
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+            model=claude_body_dict.get("model", ""), endpoint="messages",
+            prompt=prompt_str, status_code=502, client_ip=client_ip,
+            duration_ms=elapsed_ms
+        ))
         raise HTTPException(status_code=502, detail="Upstream returned non-JSON body")
 
     _record_anthropic_usage(req_id, tenant_id, provider_id,
-                            claude_body_dict.get("model", ""), elapsed_ms, data)
+                            claude_body_dict.get("model", ""), elapsed_ms, data,
+                            prompt=prompt_str, status_code=200, client_ip=client_ip)
     return JSONResponse(content=data)
 
 
@@ -576,10 +648,17 @@ async def _handle_messages_openai_convert(
     upstream_model: Optional[str],
     claude_body_dict: dict,
     tenant_id: str = "default",
+    prompt_str: Optional[str] = None,
+    client_ip: Optional[str] = None,
 ):
     """provider 仅支持 OpenAI 协议 → 走 claude→openai 转换 + openai→claude 反转。"""
     client = _get_client(provider_id, PROTOCOL_OPENAI)
     if client is None:
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+            model=claude_body_dict.get("model", ""), endpoint="messages",
+            prompt=prompt_str, status_code=502, client_ip=client_ip,
+        ))
         return _protocol_unsupported_response(req_id, provider_id, PROTOCOL_OPENAI)
 
     # 这条分支需要严格 Claude schema 才能转换
@@ -588,6 +667,11 @@ async def _handle_messages_openai_convert(
         claude_body = validated_req.model_dump(exclude_none=True)
     except Exception as e:
         logger.warning("[%s] reject | validation | %s", req_id, e)
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+            model=claude_body_dict.get("model") or "unknown", endpoint="messages",
+            prompt=prompt_str, status_code=422, client_ip=client_ip,
+        ))
         raise HTTPException(status_code=422, detail=f"Validation Error: {str(e)}")
 
     openai_req = claude_to_openai_request(claude_body)
@@ -618,6 +702,12 @@ async def _handle_messages_openai_convert(
                 exc,
                 exc_info=logger.isEnabledFor(logging.DEBUG),
             )
+            record_usage_async(UsageRecord(
+                req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+                model=openai_req.get("model", ""), endpoint="messages",
+                prompt=prompt_str, status_code=502, client_ip=client_ip,
+                duration_ms=elapsed_ms
+            ))
             raise HTTPException(status_code=502, detail="Upstream connection failed")
 
         logger.info(
@@ -652,6 +742,12 @@ async def _handle_messages_openai_convert(
                     "type": "error",
                     "error": {"type": "upstream_error", "message": text[:500]},
                 }
+            record_usage_async(UsageRecord(
+                req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+                model=openai_req.get("model", ""), endpoint="messages",
+                prompt=prompt_str, status_code=r.status_code, client_ip=client_ip,
+                duration_ms=(time.perf_counter() - t0) * 1000
+            ))
             return JSONResponse(status_code=r.status_code, content=err_content)
 
         def on_usage(u: dict):
@@ -667,6 +763,9 @@ async def _handle_messages_openai_convert(
                 cache_read_tokens=u.get("cache_read_tokens", 0),
                 cache_creation_tokens=u.get("cache_creation_tokens", 0),
                 duration_ms=elapsed_ms,
+                prompt=prompt_str,
+                status_code=200,
+                client_ip=client_ip,
             ))
 
         return StreamingResponse(
@@ -693,6 +792,12 @@ async def _handle_messages_openai_convert(
             exc,
             exc_info=logger.isEnabledFor(logging.DEBUG),
         )
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+            model=openai_req.get("model", ""), endpoint="messages",
+            prompt=prompt_str, status_code=502, client_ip=client_ip,
+            duration_ms=elapsed_ms
+        ))
         raise HTTPException(status_code=502, detail="Upstream connection failed")
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -726,12 +831,24 @@ async def _handle_messages_openai_convert(
                 resp.status_code,
                 resp.text[:800],
             )
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+            model=openai_req.get("model", ""), endpoint="messages",
+            prompt=prompt_str, status_code=resp.status_code, client_ip=client_ip,
+            duration_ms=elapsed_ms
+        ))
         return JSONResponse(status_code=resp.status_code, content=err_content)
 
     try:
         data = resp.json()
     except Exception as e:
         logger.error("[%s] upstream | invalid_json_body | %s | preview=%r", req_id, e, resp.text[:500])
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+            model=openai_req.get("model", ""), endpoint="messages",
+            prompt=prompt_str, status_code=502, client_ip=client_ip,
+            duration_ms=elapsed_ms
+        ))
         raise HTTPException(status_code=502, detail="Upstream returned non-JSON body")
 
     logger.info("[%s] upstream | ok | %s", req_id, summarize_openai_response(data))
@@ -745,6 +862,9 @@ async def _handle_messages_openai_convert(
         endpoint="messages",
         duration_ms=elapsed_ms,
         data=data,
+        prompt=prompt_str,
+        status_code=200,
+        client_ip=client_ip,
     )
     return JSONResponse(content=openai_to_claude_response(data))
 
@@ -756,38 +876,73 @@ async def handle_messages(request: Request):
         raise HTTPException(status_code=500, detail="Server not initialized properly")
 
     req_id = uuid.uuid4().hex[:12]
-    client_host = request.client.host if request.client else "?"
-    logger.info(
-        "[%s] client -> proxy | POST /v1/messages | remote=%s | ua=%r",
-        req_id,
-        client_host,
-        request.headers.get("user-agent", "")[:200],
-    )
+    client_ip = _get_client_ip(request)
+    prompt_str = None
+    tenant_id = "default"
+    provider_id = settings.DEFAULT_PROVIDER_ID
+    model_name = "unknown"
 
     content_length = request.headers.get("content-length")
     if content_length and int(content_length) > settings.MAX_BODY_SIZE:
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id, model=model_name,
+            endpoint="messages", prompt=f"<body size {content_length} exceeds limit>",
+            status_code=413, client_ip=client_ip
+        ))
         logger.warning("[%s] reject | body too large (header) | %s bytes", req_id, content_length)
         raise HTTPException(status_code=413, detail="Request entity too large")
 
     try:
         body_bytes = await request.body()
         if len(body_bytes) > settings.MAX_BODY_SIZE:
+            record_usage_async(UsageRecord(
+                req_id=req_id, tenant_id=tenant_id, provider=provider_id, model=model_name,
+                endpoint="messages", prompt=f"<body size {len(body_bytes)} exceeds limit>",
+                status_code=413, client_ip=client_ip
+            ))
             logger.warning("[%s] reject | body too large | %s bytes", req_id, len(body_bytes))
             raise HTTPException(status_code=413, detail="Request entity too large")
 
+        prompt_str = body_bytes.decode("utf-8", errors="replace")
         claude_body_dict = json.loads(body_bytes)
     except json.JSONDecodeError:
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id, model=model_name,
+            endpoint="messages", prompt=prompt_str or "<invalid json>",
+            status_code=400, client_ip=client_ip
+        ))
         logger.warning("[%s] reject | invalid JSON body", req_id)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     if not isinstance(claude_body_dict, dict):
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id, model=model_name,
+            endpoint="messages", prompt=prompt_str,
+            status_code=400, client_ip=client_ip
+        ))
         raise HTTPException(status_code=400, detail="Request body must be a JSON object")
 
-    tenant_id = _extract_tenant(request, req_id)
-    _check_tenant_allowance(tenant_id)
+    model_name = claude_body_dict.get("model") or "unknown"
+
+    try:
+        tenant_id = _authenticate_request(request, req_id)
+        _check_tenant_allowance(tenant_id)
+    except HTTPException as exc:
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id, model=model_name,
+            endpoint="messages", prompt=prompt_str,
+            status_code=exc.status_code, client_ip=client_ip
+        ))
+        raise
+
     provider_id, upstream_model = resolve_model_route(claude_body_dict.get("model"), req_id)
     provider = settings.PROVIDERS.get(provider_id)
     if provider is None:
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id, model=model_name,
+            endpoint="messages", prompt=prompt_str,
+            status_code=500, client_ip=client_ip
+        ))
         logger.error("[%s] provider not initialized: %r", req_id, provider_id)
         raise HTTPException(status_code=500, detail=f"Provider {provider_id!r} not configured")
 
@@ -797,12 +952,16 @@ async def handle_messages(request: Request):
             req_id, provider_id, upstream_model, claude_body_dict,
             query_string=request.url.query,
             tenant_id=tenant_id,
+            prompt_str=prompt_str,
+            client_ip=client_ip,
         )
     # openai-convert 分支不透传 query：原 Anthropic 协议的 query（如 ?beta=true）
     # 对 OpenAI 上游没意义，强行带上反而可能引起 400。
     return await _handle_messages_openai_convert(
         req_id, provider_id, upstream_model, claude_body_dict,
         tenant_id=tenant_id,
+        prompt_str=prompt_str,
+        client_ip=client_ip,
     )
 
 
@@ -813,6 +972,7 @@ async def handle_messages(request: Request):
 async def _openai_stream_passthrough(
     response: httpx.Response, req_id: str, t_start: float,
     tenant_id: str = "default", provider_id: str = "", model: str = "",
+    prompt_str: Optional[str] = None, client_ip: Optional[str] = None,
 ):
     """直接透传上游 SSE 数据，并解析其中包含的 usage 记录用量。"""
     chunk_count = 0
@@ -875,25 +1035,33 @@ async def _openai_stream_passthrough(
             "[%s] openai passthrough | stream_closed | chunks=%s | duration_ms=%.0f | stream_error=%s | last_usage=%s",
             req_id, chunk_count, elapsed_ms, stream_error, last_usage,
         )
+        cache_read = 0
+        input_tokens = 0
+        output_tokens = 0
         if last_usage:
-            cache_read = 0
+            input_tokens = last_usage.get("prompt_tokens", 0)
+            output_tokens = last_usage.get("completion_tokens", 0)
             details = last_usage.get("prompt_tokens_details") or {}
             if isinstance(details, dict):
                 cache_read = details.get("cached_tokens", 0)
             if cache_read == 0:
                 cache_read = last_usage.get("prompt_cache_hit_tokens", 0)
-            record_usage_async(UsageRecord(
-                req_id=req_id,
-                tenant_id=tenant_id,
-                provider=provider_id,
-                model=model,
-                endpoint="chat/completions",
-                input_tokens=last_usage.get("prompt_tokens", 0),
-                output_tokens=last_usage.get("completion_tokens", 0),
-                cache_read_tokens=cache_read,
-                cache_creation_tokens=0,
-                duration_ms=elapsed_ms,
-            ))
+
+        record_usage_async(UsageRecord(
+            req_id=req_id,
+            tenant_id=tenant_id,
+            provider=provider_id,
+            model=model,
+            endpoint="chat/completions",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read,
+            cache_creation_tokens=0,
+            duration_ms=elapsed_ms,
+            prompt=prompt_str,
+            status_code=200,
+            client_ip=client_ip,
+        ))
 
 
 @app.post("/v1/chat/completions")
@@ -903,36 +1071,75 @@ async def handle_chat_completions(request: Request):
         raise HTTPException(status_code=500, detail="Server not initialized properly")
 
     req_id = uuid.uuid4().hex[:12]
-    client_host = request.client.host if request.client else "?"
-    logger.info(
-        "[%s] client -> proxy | POST /v1/chat/completions | remote=%s | ua=%r",
-        req_id, client_host, request.headers.get("user-agent", "")[:200],
-    )
+    client_ip = _get_client_ip(request)
+    prompt_str = None
+    tenant_id = "default"
+    provider_id = settings.DEFAULT_PROVIDER_ID
+    model_name = "unknown"
 
     content_length = request.headers.get("content-length")
     if content_length and int(content_length) > settings.MAX_BODY_SIZE:
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id, model=model_name,
+            endpoint="chat/completions", prompt=f"<body size {content_length} exceeds limit>",
+            status_code=413, client_ip=client_ip
+        ))
         logger.warning("[%s] reject | body too large (header) | %s bytes", req_id, content_length)
         raise HTTPException(status_code=413, detail="Request entity too large")
 
     try:
         body_bytes = await request.body()
         if len(body_bytes) > settings.MAX_BODY_SIZE:
+            record_usage_async(UsageRecord(
+                req_id=req_id, tenant_id=tenant_id, provider=provider_id, model=model_name,
+                endpoint="chat/completions", prompt=f"<body size {len(body_bytes)} exceeds limit>",
+                status_code=413, client_ip=client_ip
+            ))
             logger.warning("[%s] reject | body too large | %s bytes", req_id, len(body_bytes))
             raise HTTPException(status_code=413, detail="Request entity too large")
+        prompt_str = body_bytes.decode("utf-8", errors="replace")
         openai_req = json.loads(body_bytes)
     except json.JSONDecodeError:
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id, model=model_name,
+            endpoint="chat/completions", prompt=prompt_str or "<invalid json>",
+            status_code=400, client_ip=client_ip
+        ))
         logger.warning("[%s] reject | invalid JSON body", req_id)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    client_model = openai_req.get("model") if isinstance(openai_req, dict) else None
-    tenant_id = _extract_tenant(request, req_id)
-    _check_tenant_allowance(tenant_id)
-    provider_id, upstream_model = resolve_model_route(client_model, req_id)
-    if isinstance(openai_req, dict) and upstream_model is not None:
+    if not isinstance(openai_req, dict):
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id, model=model_name,
+            endpoint="chat/completions", prompt=prompt_str,
+            status_code=400, client_ip=client_ip
+        ))
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+
+    model_name = openai_req.get("model") or "unknown"
+    
+    try:
+        tenant_id = _authenticate_request(request, req_id)
+        _check_tenant_allowance(tenant_id)
+    except HTTPException as exc:
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id, model=model_name,
+            endpoint="chat/completions", prompt=prompt_str,
+            status_code=exc.status_code, client_ip=client_ip
+        ))
+        raise
+
+    provider_id, upstream_model = resolve_model_route(model_name, req_id)
+    if upstream_model is not None:
         openai_req["model"] = upstream_model
 
     client = _get_client(provider_id, PROTOCOL_OPENAI)
     if client is None:
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id, model=openai_req.get("model", ""),
+            endpoint="chat/completions", prompt=prompt_str,
+            status_code=502, client_ip=client_ip
+        ))
         return _protocol_unsupported_response(req_id, provider_id, PROTOCOL_OPENAI)
 
     upstream_path = _append_query("chat/completions", request.url.query)
@@ -945,6 +1152,7 @@ async def handle_chat_completions(request: Request):
 
     is_stream = openai_req.get("stream", False)
 
+    t0 = time.perf_counter()
     if is_stream:
         if "stream_options" not in openai_req:
             openai_req["stream_options"] = {"include_usage": True}
@@ -956,7 +1164,6 @@ async def handle_chat_completions(request: Request):
             "[%s] proxy -> upstream | POST %s%s | provider=%r | model=%r | stream=true (passthrough)",
             req_id, client.base_url, upstream_path, provider_id, openai_req.get("model"),
         )
-        t0 = time.perf_counter()
         try:
             r = await client.send(built, stream=True)
         except httpx.RequestError as exc:
@@ -966,6 +1173,12 @@ async def handle_chat_completions(request: Request):
                 req_id, elapsed_ms, exc,
                 exc_info=logger.isEnabledFor(logging.DEBUG),
             )
+            record_usage_async(UsageRecord(
+                req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+                model=openai_req.get("model", ""), endpoint="chat/completions",
+                prompt=prompt_str, status_code=502, client_ip=client_ip,
+                duration_ms=elapsed_ms
+            ))
             raise HTTPException(status_code=502, detail="Upstream connection failed")
 
         if r.status_code != 200:
@@ -976,6 +1189,12 @@ async def handle_chat_completions(request: Request):
                 err_content = json.loads(text)
             except json.JSONDecodeError:
                 err_content = {"error": {"message": text[:500], "type": "upstream_error"}}
+            record_usage_async(UsageRecord(
+                req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+                model=openai_req.get("model", ""), endpoint="chat/completions",
+                prompt=prompt_str, status_code=r.status_code, client_ip=client_ip,
+                duration_ms=(time.perf_counter() - t0) * 1000
+            ))
             return JSONResponse(status_code=r.status_code, content=err_content)
 
         return StreamingResponse(
@@ -983,6 +1202,8 @@ async def handle_chat_completions(request: Request):
                 r, req_id, t0,
                 tenant_id=tenant_id, provider_id=provider_id,
                 model=openai_req.get("model", ""),
+                prompt_str=prompt_str,
+                client_ip=client_ip,
             ),
             media_type="text/event-stream",
         )
@@ -992,7 +1213,6 @@ async def handle_chat_completions(request: Request):
         "[%s] proxy -> upstream | POST %s%s | provider=%r | model=%r | stream=false (passthrough)",
         req_id, client.base_url, upstream_path, provider_id, openai_req.get("model"),
     )
-    t0 = time.perf_counter()
     try:
         resp = await client.post(upstream_path, json=openai_req)
     except httpx.RequestError as exc:
@@ -1002,6 +1222,12 @@ async def handle_chat_completions(request: Request):
             req_id, elapsed_ms, exc,
             exc_info=logger.isEnabledFor(logging.DEBUG),
         )
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+            model=openai_req.get("model", ""), endpoint="chat/completions",
+            prompt=prompt_str, status_code=502, client_ip=client_ip,
+            duration_ms=elapsed_ms
+        ))
         raise HTTPException(status_code=502, detail="Upstream connection failed")
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
@@ -1016,12 +1242,24 @@ async def handle_chat_completions(request: Request):
         except Exception:
             err_content = {"error": {"message": resp.text[:500], "type": "upstream_error"}}
         logger.error("[%s] upstream | error | status=%s | %s", req_id, resp.status_code, json_preview(err_content))
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+            model=openai_req.get("model", ""), endpoint="chat/completions",
+            prompt=prompt_str, status_code=resp.status_code, client_ip=client_ip,
+            duration_ms=elapsed_ms
+        ))
         return JSONResponse(status_code=resp.status_code, content=err_content)
 
     try:
         data = resp.json()
     except Exception as e:
         logger.error("[%s] upstream | invalid_json_body | %s | preview=%r", req_id, e, resp.text[:500])
+        record_usage_async(UsageRecord(
+            req_id=req_id, tenant_id=tenant_id, provider=provider_id,
+            model=openai_req.get("model", ""), endpoint="chat/completions",
+            prompt=prompt_str, status_code=502, client_ip=client_ip,
+            duration_ms=elapsed_ms
+        ))
         raise HTTPException(status_code=502, detail="Upstream returned non-JSON body")
 
     logger.info("[%s] upstream | ok | %s", req_id, summarize_openai_response(data))
@@ -1033,6 +1271,9 @@ async def handle_chat_completions(request: Request):
         endpoint="chat/completions",
         duration_ms=elapsed_ms,
         data=data,
+        prompt=prompt_str,
+        status_code=200,
+        client_ip=client_ip,
     )
     return JSONResponse(content=data)
 
@@ -1047,14 +1288,19 @@ async def handle_list_models(request: Request):
         raise HTTPException(status_code=500, detail="Server not initialized properly")
 
     req_id = uuid.uuid4().hex[:12]
+    
+    # 强制校验 API key 并检测租户状态
+    tenant_id = _authenticate_request(request, req_id)
+    _check_tenant_allowance(tenant_id)
+
     provider_id = settings.DEFAULT_PROVIDER_ID
     client = _get_client(provider_id, PROTOCOL_OPENAI)
     if client is None:
         return _protocol_unsupported_response(req_id, provider_id, PROTOCOL_OPENAI)
     upstream_path = _append_query("models", request.url.query)
     logger.info(
-        "[%s] client -> proxy | GET /v1/models | provider=%r | upstream_path=%r",
-        req_id, provider_id, upstream_path,
+        "[%s] client -> proxy | GET /v1/models | provider=%r | upstream_path=%r | tenant=%r",
+        req_id, provider_id, upstream_path, tenant_id,
     )
 
     t0 = time.perf_counter()

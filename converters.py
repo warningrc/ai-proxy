@@ -88,15 +88,22 @@ def claude_to_openai_request(claude_data: Dict[str, Any]) -> Dict[str, Any]:
                 continue # Skip the default append since we handled split roles
 
         elif role == "assistant":
-            # Handle tool_use in assistant message -> tool_calls in OpenAI
+            # Handle tool_use and thinking in assistant message -> tool_calls in OpenAI
             if isinstance(content, list):
                 text_parts = []
                 tool_calls = []
                 
                 for block in content:
-                    if block["type"] == "text":
-                        text_parts.append(block["text"])
-                    elif block["type"] == "tool_use":
+                    btype = block.get("type")
+                    if btype == "text":
+                        if block.get("text"):
+                            text_parts.append(block["text"])
+                    elif btype == "thinking":
+                        if block.get("thinking"):
+                            text_parts.append(f"<thinking>\n{block['thinking']}\n</thinking>")
+                    elif btype == "redacted_thinking":
+                        text_parts.append("<thinking>\n[Thinking Process Redacted]\n</thinking>")
+                    elif btype == "tool_use":
                         tool_calls.append({
                             "id": block["id"],
                             "type": "function",

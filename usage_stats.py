@@ -34,6 +34,9 @@ class UsageRecord:
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
     duration_ms: float = 0.0
+    prompt: Optional[str] = None
+    status_code: Optional[int] = None
+    client_ip: Optional[str] = None
 
 
 @dataclass
@@ -71,7 +74,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now','localtime'))
 );
 
-CREATE TABLE IF NOT EXISTS usage_log (
+CREATE TABLE IF NOT EXISTS request_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S','now','localtime')),
     req_id      TEXT    NOT NULL,
@@ -79,6 +82,9 @@ CREATE TABLE IF NOT EXISTS usage_log (
     provider    TEXT    NOT NULL,
     model       TEXT    NOT NULL,
     endpoint    TEXT    NOT NULL,
+    prompt      TEXT,
+    status_code INTEGER,
+    client_ip   TEXT,
     input_tokens    INTEGER NOT NULL DEFAULT 0,
     output_tokens   INTEGER NOT NULL DEFAULT 0,
     total_tokens    INTEGER GENERATED ALWAYS AS (input_tokens + output_tokens) STORED,
@@ -87,8 +93,8 @@ CREATE TABLE IF NOT EXISTS usage_log (
     duration_ms     REAL    NOT NULL DEFAULT 0
 );
 
-CREATE INDEX IF NOT EXISTS idx_usage_tenant_model_ts ON usage_log (tenant_id, model, ts);
-CREATE INDEX IF NOT EXISTS idx_usage_ts              ON usage_log (ts);
+CREATE INDEX IF NOT EXISTS idx_request_tenant_model_ts ON request_log (tenant_id, model, ts);
+CREATE INDEX IF NOT EXISTS idx_request_ts              ON request_log (ts);
 """
 
 
@@ -110,8 +116,36 @@ class UsageStats:
 
     def init_db(self) -> None:
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        
+        # 1. 检测并升级旧表名 usage_log -> request_log
+        with self._lock:
+            cursor = self._conn.cursor()
+            cursor.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='usage_log'")
+            if cursor.fetchone()[0] > 0:
+                try:
+                    self._conn.execute("ALTER TABLE usage_log RENAME TO request_log")
+                    self._conn.execute("DROP INDEX IF EXISTS idx_usage_tenant_model_ts")
+                    self._conn.execute("DROP INDEX IF EXISTS idx_usage_ts")
+                except sqlite3.OperationalError:
+                    pass
+            self._conn.commit()
+
+        # 2. 执行建表脚本
         self._conn.executescript(_SCHEMA_SQL)
         self._conn.commit()
+
+        # 3. 对已有的 request_log 表追加新列（如果不存在的话）
+        with self._lock:
+            for col_def in [
+                ("prompt", "TEXT"),
+                ("status_code", "INTEGER"),
+                ("client_ip", "TEXT")
+            ]:
+                try:
+                    self._conn.execute(f"ALTER TABLE request_log ADD COLUMN {col_def[0]} {col_def[1]}")
+                except sqlite3.OperationalError:
+                    pass
+            self._conn.commit()
 
     def upsert_tenants(self, tenants: Sequence[Dict[str, Any]]) -> None:
         """
@@ -187,11 +221,12 @@ class UsageStats:
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO usage_log
+                INSERT INTO request_log
                     (req_id, tenant_id, provider, model, endpoint,
+                     prompt, status_code, client_ip,
                      input_tokens, output_tokens, cache_read_tokens,
                      cache_creation_tokens, duration_ms)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.req_id,
@@ -199,6 +234,9 @@ class UsageStats:
                     record.provider,
                     record.model,
                     record.endpoint,
+                    record.prompt,
+                    record.status_code,
+                    record.client_ip,
                     record.input_tokens,
                     record.output_tokens,
                     record.cache_read_tokens,
@@ -279,7 +317,7 @@ class UsageStats:
                    SUM(total_tokens) as total_tokens,
                    SUM(cache_read_tokens) as cache_read_tokens,
                    SUM(cache_creation_tokens) as cache_creation_tokens
-            FROM usage_log
+            FROM request_log
             {where_sql}
             GROUP BY {group_str}
             ORDER BY request_count DESC
@@ -312,7 +350,7 @@ class UsageStats:
         if not since or not until:
             with self._lock:
                 bounds = self._conn.execute(
-                    "SELECT MIN(ts), MAX(ts) FROM usage_log"
+                    "SELECT MIN(ts), MAX(ts) FROM request_log"
                 ).fetchone()
             if bounds and bounds[0]:
                 if not since:

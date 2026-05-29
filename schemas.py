@@ -2,7 +2,7 @@ from typing import List, Union, Optional, Any, Literal, Dict
 from pydantic import BaseModel, Field, field_validator
 
 class ClaudeContentBlock(BaseModel):
-    type: Literal["text", "image", "tool_use", "tool_result"]
+    type: str
     text: Optional[str] = None
     # Image fields
     source: Optional[dict] = None 
@@ -14,6 +14,9 @@ class ClaudeContentBlock(BaseModel):
     tool_use_id: Optional[str] = None
     content: Optional[Union[str, List[Dict[str, Any]]]] = None # Recursive definition simplified
     is_error: Optional[bool] = False
+    # Thinking fields
+    thinking: Optional[str] = None
+    signature: Optional[str] = None
 
     @field_validator('source')
     def validate_source(cls, v):
