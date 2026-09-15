@@ -77,3 +77,21 @@ def log_stream_chunk_debug(req_id: str, chunk_index: int, data: Dict[str, Any]) 
         return
     preview = json_preview(data, max_chars=4000)
     logger.debug("[%s] upstream SSE chunk #%s %s", req_id, chunk_index, preview)
+
+
+def log_json_preview(
+    logger_: logging.Logger,
+    prefix: str,
+    req_id: str,
+    obj: Any,
+    max_chars: int = 6000,
+) -> None:
+    """在 DEBUG 级别记录一个 JSON 对象的截断预览。
+
+    不要写成 ``logger.debug("...%s", json_preview(obj))``：函数参数在调用前就求值了，
+    即使 DEBUG 没开，也会把整个请求体（实测几百 KB）先 json.dumps 一遍再丢掉。
+    请求体 / 响应体这类大对象走日志前必须先判级别。
+    """
+    if not logger_.isEnabledFor(logging.DEBUG):
+        return
+    logger_.debug("[%s] %s=%s", req_id, prefix, json_preview(obj, max_chars))

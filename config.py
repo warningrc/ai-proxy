@@ -67,6 +67,9 @@ class ProviderConfig:
     id: str
     openai: Optional[ProviderEndpoint] = None
     anthropic: Optional[ProviderEndpoint] = None
+    # 手动指定的模型列表（可选）。非空时代替上游 GET /models 的自动发现，
+    # 适用于不提供 /models 接口的上游（如火山方舟部分端点）。
+    models: List[str] = field(default_factory=list)
 
     def endpoint(self, protocol: str) -> Optional[ProviderEndpoint]:
         if protocol == PROTOCOL_OPENAI:
@@ -93,6 +96,20 @@ class TenantConfig:
     name: str
     api_key: str  # 明文，仅在启动时哈希后用于匹配
     status: str = "active"
+
+
+@dataclass
+class AdminConfig:
+    """管理界面认证配置。
+
+    二选一：
+      - password       : 明文密码（仅开发期方便，与 tenant api_key 明文存储风格一致）
+      - password_hash  : sha256(password) 的十六进制（生产推荐）
+    两者都配置时优先校验 password_hash。
+    """
+    username: str
+    password: Optional[str] = None
+    password_hash: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +229,11 @@ def _parse_providers(raw: Any) -> List[ProviderConfig]:
         pid = str(item.get("id", "")).strip()
         if not pid:
             _die(f"providers[{i}] 缺少 id")
+        if "/" in pid:
+            _die(
+                f"providers[{i}].id 不能包含 '/' 字符"
+                f"（用于 /v1/models 的 provider_id/model_name 命名空间路由）: {pid!r}"
+            )
         if pid in seen_ids:
             _die(f"providers 中存在重复 id: {pid!r}")
         seen_ids.add(pid)
@@ -228,6 +250,24 @@ def _parse_providers(raw: Any) -> List[ProviderConfig]:
 
         # 顶层 api_key 作为共享默认值（可选）；任一协议子表里的 api_key 会覆盖它。
         shared_api_key = str(item.get("api_key", "")).strip() or None
+
+        # 手动模型列表（可选）：非空时代替该 provider 的 /models 自动发现。
+        raw_models = item.get("models")
+        models: List[str] = []
+        if raw_models is not None:
+            if not isinstance(raw_models, list):
+                _die(
+                    f"providers[{pid!r}].models 必须是字符串数组"
+                    f"（models = [\"model-a\", \"model-b\"]）"
+                )
+            seen_models: set[str] = set()
+            for j, m in enumerate(raw_models):
+                if not isinstance(m, str) or not m.strip():
+                    _die(f"providers[{pid!r}].models[{j}] 必须是非空字符串")
+                mm = m.strip()
+                if mm not in seen_models:
+                    seen_models.add(mm)
+                    models.append(mm)
 
         openai_ep = (
             _parse_endpoint(item["openai"], pid, PROTOCOL_OPENAI, shared_api_key)
@@ -248,6 +288,7 @@ def _parse_providers(raw: Any) -> List[ProviderConfig]:
             id=pid,
             openai=openai_ep,
             anthropic=anthropic_ep,
+            models=models,
         ))
 
     return providers
@@ -353,6 +394,26 @@ def _parse_model_routes(
     return result
 
 
+def _parse_admin(raw: Any) -> Optional[AdminConfig]:
+    """解析 [admin] 段。允许缺失（返回 None，表示未启用管理界面认证）。"""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        _die("admin 必须是表（[admin] 段）")
+
+    username = str(raw.get("username", "")).strip()
+    if not username:
+        _die("admin.username 不能为空")
+
+    password = str(raw.get("password", "")).strip() or None
+    password_hash = str(raw.get("password_hash", "")).strip().lower() or None
+
+    if not password and not password_hash:
+        _die("admin 至少需要配置 password 或 password_hash 之一")
+
+    return AdminConfig(username=username, password=password, password_hash=password_hash)
+
+
 # ---------------------------------------------------------------------------
 #  Settings
 # ---------------------------------------------------------------------------
@@ -366,10 +427,19 @@ class Settings:
     DEFAULT_PROVIDER_ID: str
     MODEL_ROUTES: Dict[str, List[ModelRoute]]
     TENANTS: List[TenantConfig]
+    ADMIN: Optional[AdminConfig]
     STATS_DB: str
 
     LOG_LEVEL: str
     MAX_BODY_SIZE: int
+    STATS_RETENTION_DAYS: int
+    STATS_PROMPT_MAX_CHARS: int
+    STATS_FLUSH_INTERVAL: float
+    STATS_BATCH_SIZE: int
+    POOL_MAX_CONNECTIONS: int
+    POOL_MAX_KEEPALIVE: int
+    POOL_KEEPALIVE_EXPIRY: float
+    CONFIG_WATCH_INTERVAL: float
     TIMEOUT_CONNECT: float
     TIMEOUT_READ: float
     TIMEOUT_WRITE: float
@@ -380,45 +450,199 @@ class Settings:
     def __init__(self):
         path = Path(os.getenv(CONFIG_FILE_ENV, DEFAULT_CONFIG_PATH)).expanduser()
         self.CONFIG_PATH = path
-
         data = _load_toml(path)
+        self._populate_from(data)
 
+    def _populate_from(self, data: Dict[str, Any]) -> None:
+        """从已解析的 TOML dict 填充各字段。reload 时复用。
+
+        解析阶段只写局部变量，全部成功后才一次性写回 self。任何 _die（配置非法）
+        都发生在 self 被改动之前，因此 reload 失败时运行态保持原样 —— 后台配置
+        监听依赖这个性质：配置文件被外部改坏，不能让正在服务的进程变成半新半旧。
+        """
         # --- 1. providers ---
         providers_list = _parse_providers(data.get("providers"))
-        self.PROVIDERS = {p.id: p for p in providers_list}
+        providers = {p.id: p for p in providers_list}
 
         # --- 2. default_provider ---
         default = str(data.get("default_provider", "")).strip()
         if not default:
             default = providers_list[0].id
-        elif default not in self.PROVIDERS:
+        elif default not in providers:
             _die(
                 f"default_provider={default!r} 不在 providers 中"
-                f"（已知: {sorted(self.PROVIDERS)}）"
+                f"（已知: {sorted(providers)}）"
             )
-        self.DEFAULT_PROVIDER_ID = default
 
         # --- 3. model_routes ---
-        self.MODEL_ROUTES = _parse_model_routes(
+        model_routes = _parse_model_routes(
             data.get("model_routes"),
-            known_provider_ids=set(self.PROVIDERS),
+            known_provider_ids=set(providers),
         )
 
         # --- 4. tenants ---
-        self.TENANTS = _parse_tenants(data.get("tenants"))
+        tenants = _parse_tenants(data.get("tenants"))
 
-        # --- 5. 其他全局参数 ---
-        self.LOG_LEVEL = str(data.get("log_level", "INFO")).upper()
-        self.MAX_BODY_SIZE = int(data.get("max_body_size", 15728640))
-        self.STATS_DB = str(data.get("stats_db", "./stats.db")).strip()
+        # --- 5. admin ---
+        admin = _parse_admin(data.get("admin"))
+
+        # --- 6. 其他全局参数 ---
+        log_level = str(data.get("log_level", "INFO")).upper()
+        max_body_size = int(data.get("max_body_size", 15728640))
+        stats_db = str(data.get("stats_db", "./stats.db")).strip()
+        # 统计数据保留天数：超过这个天数的 request_log 记录会被后台任务清理。
+        # 设为 <=0 表示关闭自动清理（保留全部历史）。
+        stats_retention_days = int(data.get("stats_retention_days", 30))
+        # 入库的 prompt 前缀长度上限（字符）。请求体全文对计费没有价值，却曾经占到
+        # stats.db 的 88%；<=0 表示完全不存 prompt。
+        stats_prompt_max_chars = int(data.get("stats_prompt_max_chars", 2048))
+        # 用量写库的批量参数：攒够 stats_batch_size 条或等满 stats_flush_interval 秒
+        # 就提交一次。写库发生在后台线程，不影响请求延迟。
+        stats_flush_interval = float(data.get("stats_flush_interval", 0.5))
+        stats_batch_size = int(data.get("stats_batch_size", 500))
+        # 每个 provider 的上游连接池上限。httpx 默认 max_connections=100，对网关来说
+        # 是硬性并发天花板：第 101 个请求只能在池里排队，超时即 502。
+        pool_max_connections = int(data.get("pool_max_connections", 500))
+        pool_max_keepalive = int(data.get("pool_max_keepalive", 100))
+        # 空闲连接保持时间。httpx 默认 5s，对「持续有流量但速率不高」的网关会导致
+        # 频繁重连（含 TLS 握手），调大明显省事。
+        pool_keepalive_expiry = float(data.get("pool_keepalive_expiry", 60.0))
+        # 后台配置监听轮询间隔（秒）。多 worker 下靠它把配置变更广播到所有进程；
+        # <=0 关闭监听（仅单进程或由外部负责重启时使用）。
+        config_watch_interval = float(data.get("config_watch_interval", 2.0))
 
         timeouts = data.get("timeouts", {}) or {}
         if not isinstance(timeouts, dict):
             _die("timeouts 必须是表（[timeouts] 段）")
-        self.TIMEOUT_CONNECT = float(timeouts.get("connect", 5.0))
-        self.TIMEOUT_READ = float(timeouts.get("read", 300.0))
-        self.TIMEOUT_WRITE = float(timeouts.get("write", 20.0))
-        self.TIMEOUT_POOL = float(timeouts.get("pool", 10.0))
+        timeout_connect = float(timeouts.get("connect", 5.0))
+        timeout_read = float(timeouts.get("read", 300.0))
+        timeout_write = float(timeouts.get("write", 20.0))
+        timeout_pool = float(timeouts.get("pool", 10.0))
+
+        # --- 提交阶段：以上全部解析通过，才改动 self ---
+        self.PROVIDERS = providers
+        self.DEFAULT_PROVIDER_ID = default
+        self.MODEL_ROUTES = model_routes
+        self.TENANTS = tenants
+        self.ADMIN = admin
+
+        self.LOG_LEVEL = log_level
+        self.MAX_BODY_SIZE = max_body_size
+        self.STATS_DB = stats_db
+        self.STATS_RETENTION_DAYS = stats_retention_days
+        self.STATS_PROMPT_MAX_CHARS = stats_prompt_max_chars
+        self.STATS_FLUSH_INTERVAL = stats_flush_interval
+        self.STATS_BATCH_SIZE = stats_batch_size
+        self.POOL_MAX_CONNECTIONS = pool_max_connections
+        self.POOL_MAX_KEEPALIVE = pool_max_keepalive
+        self.POOL_KEEPALIVE_EXPIRY = pool_keepalive_expiry
+        self.CONFIG_WATCH_INTERVAL = config_watch_interval
+
+        self.TIMEOUT_CONNECT = timeout_connect
+        self.TIMEOUT_READ = timeout_read
+        self.TIMEOUT_WRITE = timeout_write
+        self.TIMEOUT_POOL = timeout_pool
+
+    def to_dict(self) -> Dict[str, Any]:
+        """把当前 settings 序列化为可写回 TOML 的 dict（与配置文件结构一致）。
+
+        api_key 保留明文（仅用于写回磁盘，不经网络传输；GET /admin/api/config
+        会在路由层做脱敏）。
+        """
+        providers_out: List[Dict[str, Any]] = []
+        for p in self.PROVIDERS.values():
+            item: Dict[str, Any] = {"id": p.id}
+
+            openai_key = p.openai.api_key if p.openai else None
+            anthropic_key = p.anthropic.api_key if p.anthropic else None
+            keys = [k for k in (openai_key, anthropic_key) if k is not None]
+            shared = len(keys) > 0 and len(set(keys)) == 1
+
+            if shared:
+                item["api_key"] = keys[0]
+
+            if p.models:
+                item["models"] = list(p.models)
+
+            if p.openai:
+                openai_tbl: Dict[str, Any] = {"base_url": p.openai.base_url}
+                if not shared:
+                    openai_tbl["api_key"] = p.openai.api_key
+                if p.openai.auth_style != DEFAULT_AUTH_STYLE_BY_PROTOCOL[PROTOCOL_OPENAI]:
+                    openai_tbl["auth_style"] = p.openai.auth_style
+                if p.openai.headers:
+                    openai_tbl["headers"] = dict(p.openai.headers)
+                item["openai"] = openai_tbl
+
+            if p.anthropic:
+                anth_tbl: Dict[str, Any] = {"base_url": p.anthropic.base_url}
+                if not shared:
+                    anth_tbl["api_key"] = p.anthropic.api_key
+                if p.anthropic.auth_style != DEFAULT_AUTH_STYLE_BY_PROTOCOL[PROTOCOL_ANTHROPIC]:
+                    anth_tbl["auth_style"] = p.anthropic.auth_style
+                if p.anthropic.headers:
+                    anth_tbl["headers"] = dict(p.anthropic.headers)
+                item["anthropic"] = anth_tbl
+
+            providers_out.append(item)
+
+        routes_out: Dict[str, Any] = {}
+        for client_model, routes in self.MODEL_ROUTES.items():
+            # 当前只使用 inline 单条路由形式
+            r = routes[0]
+            entry: Dict[str, str] = {"provider": r.provider_id}
+            if r.upstream_model is not None:
+                entry["model"] = r.upstream_model
+            routes_out[client_model] = entry
+
+        tenants_out: List[Dict[str, Any]] = [
+            {"id": t.id, "name": t.name, "api_key": t.api_key, "status": t.status}
+            for t in self.TENANTS
+        ]
+
+        result: Dict[str, Any] = {
+            "log_level": self.LOG_LEVEL,
+            "max_body_size": self.MAX_BODY_SIZE,
+            "default_provider": self.DEFAULT_PROVIDER_ID,
+            "stats_db": self.STATS_DB,
+            "stats_retention_days": self.STATS_RETENTION_DAYS,
+            "stats_prompt_max_chars": self.STATS_PROMPT_MAX_CHARS,
+            "stats_flush_interval": self.STATS_FLUSH_INTERVAL,
+            "stats_batch_size": self.STATS_BATCH_SIZE,
+            "pool_max_connections": self.POOL_MAX_CONNECTIONS,
+            "pool_max_keepalive": self.POOL_MAX_KEEPALIVE,
+            "pool_keepalive_expiry": self.POOL_KEEPALIVE_EXPIRY,
+            "config_watch_interval": self.CONFIG_WATCH_INTERVAL,
+            "timeouts": {
+                "connect": self.TIMEOUT_CONNECT,
+                "read": self.TIMEOUT_READ,
+                "write": self.TIMEOUT_WRITE,
+                "pool": self.TIMEOUT_POOL,
+            },
+            "providers": providers_out,
+            "model_routes": routes_out,
+            "tenants": tenants_out,
+        }
+
+        if self.ADMIN is not None:
+            admin_tbl: Dict[str, Any] = {"username": self.ADMIN.username}
+            if self.ADMIN.password_hash:
+                admin_tbl["password_hash"] = self.ADMIN.password_hash
+            elif self.ADMIN.password:
+                admin_tbl["password"] = self.ADMIN.password
+            result["admin"] = admin_tbl
+
+        return result
+
+
+def reload() -> None:
+    """从磁盘重读 config.toml，原地替换模块级 ``settings`` 的字段。
+
+    用于热重载：保留 ``settings`` 对象引用不变，只更新其属性，避免其他模块
+    已绑定的 ``from config import settings`` 失效。
+    """
+    data = _load_toml(settings.CONFIG_PATH)
+    settings._populate_from(data)
 
 
 settings = Settings()

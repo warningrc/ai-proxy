@@ -1,0 +1,1933 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ai-proxy 管理界面</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2027;
+    --panel-2: #232b34;
+    --border: #2d3744;
+    --text: #e2e8f0;
+    --text-dim: #94a3b8;
+    --primary: #3b82f6;
+    --primary-hover: #2563eb;
+    --danger: #ef4444;
+    --success: #10b981;
+    --warn: #f59e0b;
+
+    /* ---- 图表配色 ----
+       分类色板（模型 = 身份维度）。7 槽按固定顺序分配、绝不循环；第 8 个及以后的
+       模型一律用 --series-other 的中性灰，而不是生成新色。
+       本页面只有暗色一套主题，色板是对着图表实际落地的卡片底色 --panel (#1a2027)
+       校验的，不是对着通用暗色底：validate_palette.js 六项检查全部 PASS
+       （最差相邻色盲 ΔE 8.4 protan / 8.7 tritan，最差相邻正常视觉 ΔE 19.3，
+       对比度均 >= 3:1）。改动任何一个值都要重新跑校验。 */
+    --series-1: #3987e5;   /* 蓝 */
+    --series-2: #d95926;   /* 橙 */
+    --series-3: #199e70;   /* 青 */
+    --series-4: #c98500;   /* 黄 */
+    --series-5: #d55181;   /* 品红 */
+    --series-6: #008300;   /* 绿 */
+    --series-7: #9085e9;   /* 紫 */
+    --series-other: #8b93a1;  /* 「其他」：去强调中性灰，刻意不属于分类色板 */
+    --chart-grid: #2d3744;    /* 网格线，比底色深一档的细实线 */
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+  }
+
+  /* ---- 登录页 ---- */
+  .login-wrap {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .login-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 32px;
+    width: 360px;
+  }
+  .login-card h1 { margin: 0 0 8px; font-size: 20px; }
+  .login-card .sub { color: var(--text-dim); margin-bottom: 24px; font-size: 13px; }
+
+  /* ---- 通用表单 ---- */
+  label { display: block; color: var(--text-dim); font-size: 12px; margin-bottom: 4px; }
+  input, select, textarea {
+    width: 100%;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13px;
+    font-family: inherit;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: var(--primary);
+  }
+  .field { margin-bottom: 14px; }
+
+  button {
+    background: var(--primary);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+    cursor: pointer;
+    font-size: 13px;
+    font-family: inherit;
+  }
+  button:hover { background: var(--primary-hover); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.ghost {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+  button.ghost:hover { background: var(--panel-2); color: var(--text); }
+  button.danger { background: var(--danger); }
+  button.sm { padding: 4px 10px; font-size: 12px; }
+
+  /* ---- 布局 ---- */
+  .topbar {
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    height: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .topbar .title { font-weight: 600; }
+  .topbar .actions { display: flex; gap: 10px; align-items: center; }
+  .topbar .user { color: var(--text-dim); font-size: 12px; }
+
+  .tabs {
+    display: flex;
+    gap: 2px;
+    padding: 0 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .tab {
+    padding: 12px 18px;
+    cursor: pointer;
+    color: var(--text-dim);
+    border-bottom: 2px solid transparent;
+    font-size: 13px;
+  }
+  .tab.active { color: var(--text); border-bottom-color: var(--primary); }
+  .tab:hover { color: var(--text); }
+
+  .content { padding: 24px; max-width: 1200px; }
+
+  /* ---- 卡片/表格 ---- */
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 18px;
+    margin-bottom: 16px;
+  }
+  .card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+  }
+  .card-head h3 { margin: 0; font-size: 15px; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  th { color: var(--text-dim); font-weight: 500; font-size: 12px; }
+  td input, td select { padding: 5px 8px; }
+  .row-actions { display: flex; gap: 6px; }
+
+  .empty { color: var(--text-dim); text-align: center; padding: 24px; font-size: 13px; }
+
+  /* ---- 提示 ---- */
+  .toast {
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    background: var(--success);
+    color: #fff;
+    padding: 12px 18px;
+    border-radius: 6px;
+    z-index: 1000;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  }
+  .toast.error { background: var(--danger); }
+  .error-box {
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid var(--danger);
+    color: #fca5a5;
+    padding: 12px;
+    border-radius: 6px;
+    margin: 12px 0;
+    white-space: pre-wrap;
+    font-size: 12px;
+    font-family: "SF Mono", Menlo, monospace;
+  }
+  .hint { color: var(--text-dim); font-size: 12px; margin-top: 4px; }
+  .mono { font-family: "SF Mono", Menlo, monospace; font-size: 12px; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    background: var(--panel-2);
+    color: var(--text-dim);
+  }
+  .badge.on { background: rgba(16, 185, 129, 0.15); color: var(--success); }
+
+  /* ---- 用量统计：筛选行 / KPI / 图表 ---- */
+  .filter-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    align-items: flex-end;
+  }
+  .filter-row .field { margin-bottom: 0; }
+  .preset-group { display: flex; gap: 6px; }
+  .preset-group button { padding: 8px 12px; }
+  .preset-group button.active {
+    background: var(--primary);
+    color: #fff;
+  }
+  .preset-group button:not(.active) {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+  .preset-group button:not(.active):hover {
+    background: var(--panel-2);
+    color: var(--text);
+  }
+  .range-inputs { display: flex; gap: 6px; align-items: center; }
+  .range-inputs input { width: 150px; }
+  .range-inputs span { color: var(--text-dim); }
+
+  .stat-tile {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .stat-tile .k { color: var(--text-dim); font-size: 12px; }
+  .stat-tile .v {
+    font-size: 24px;
+    font-weight: 600;
+    margin-top: 6px;
+    /* 大号独立数字用比例数字，tabular-nums 会让 121 这种看着松散 */
+    font-variant-numeric: normal;
+  }
+  .stat-tile .sub { color: var(--text-dim); font-size: 11px; margin-top: 2px; }
+
+  /* 刷新时按住上一帧、降低透明度，不做骨架闪烁、不跳布局 */
+  .is-refreshing { opacity: 0.5; transition: opacity 0.15s; }
+
+  .chart-wrap { position: relative; }
+  .chart-wrap svg { display: block; width: 100%; }
+  .chart-wrap text { font-family: inherit; }
+  .axis-text {
+    fill: var(--text-dim);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;  /* 刻度要纵向对齐 */
+  }
+  .grid-line { stroke: var(--chart-grid); stroke-width: 1; shape-rendering: crispEdges; }
+  .baseline { stroke: var(--border); stroke-width: 1; shape-rendering: crispEdges; }
+  .bar-hit { fill: transparent; cursor: crosshair; outline: none; }
+  .bar-hit:focus { fill: rgba(148, 163, 184, 0.12); }
+  .cap-label { fill: var(--text); font-size: 11px; font-weight: 500; }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    margin-top: 12px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--text-dim);       /* 文字用文本色，身份由旁边的色块承担 */
+    user-select: none;
+  }
+  .legend-item:hover { color: var(--text); }
+  .legend-item.off { opacity: 0.4; }
+  .legend-item.off .swatch { background: var(--border) !important; }
+  .swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+    flex: none;
+  }
+
+  .chart-tip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 12px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+    z-index: 20;
+    display: none;
+    min-width: 150px;
+  }
+  .chart-tip .tip-head {
+    color: var(--text);
+    font-weight: 600;
+    margin-bottom: 6px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .chart-tip .tip-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 4px;
+    color: var(--text-dim);
+  }
+  .chart-tip .tip-row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px; }
+  .chart-tip .tip-row .val { color: var(--text); font-variant-numeric: tabular-nums; }
+  .chart-tip .tip-row.total {
+    border-top: 1px solid var(--border);
+    margin-top: 6px;
+    padding-top: 6px;
+  }
+  .chart-tip .tip-row.total .val { font-weight: 600; }
+
+  /* 统计表：模型名不换行，列宽不够时横向滚动 */
+  #s_body table th, #s_body table td { white-space: nowrap; }
+
+  /* 宽表横向滚动时冻结首列。每日明细有 10 列，「合计」在最右边，
+     滚过去之后必须还认得出这一行是哪一天，否则那几个数字没有意义。
+     底色用 --panel 盖住下面滚过去的单元格；右侧用 box-shadow 画分隔线
+     （border-collapse 下 sticky 单元格的 border 会跟着滚走）。 */
+  #s_body .tbl-scroll { overflow-x: auto; }
+  #s_body .tbl-scroll th:first-child,
+  #s_body .tbl-scroll td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background: var(--panel);
+    box-shadow: 1px 0 0 var(--border);
+  }
+  #s_body .tbl-scroll thead th:first-child { z-index: 2; }
+
+  @media (max-width: 900px) {
+    .grid-4 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr; }
+    .filter-row { gap: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- 登录页 -->
+<div id="loginView" class="login-wrap">
+  <div class="login-card">
+    <h1>ai-proxy 管理界面</h1>
+    <div class="sub">请使用管理员账号登录</div>
+    <div id="loginError" class="error-box" style="display:none"></div>
+    <div class="field">
+      <label>用户名</label>
+      <input id="loginUser" type="text" autocomplete="username">
+    </div>
+    <div class="field">
+      <label>密码</label>
+      <input id="loginPass" type="password" autocomplete="current-password">
+    </div>
+    <button id="loginBtn" style="width:100%">登录</button>
+  </div>
+</div>
+
+<!-- 主界面 -->
+<div id="appView" style="display:none">
+  <div class="topbar">
+    <div class="title">ai-proxy 管理界面</div>
+    <div class="actions">
+      <span class="user" id="topUser"></span>
+      <button class="ghost sm" id="logoutBtn">退出登录</button>
+    </div>
+  </div>
+  <div class="tabs">
+    <div class="tab active" data-tab="global">全局参数</div>
+    <div class="tab" data-tab="providers">Providers</div>
+    <div class="tab" data-tab="routes">模型路由</div>
+    <div class="tab" data-tab="tenants">租户</div>
+    <div class="tab" data-tab="stats">用量统计</div>
+    <div style="flex:1"></div>
+    <div class="tab" style="color:var(--success)" id="saveAllBtn">💾 保存配置并热重载</div>
+  </div>
+  <div id="toast" class="toast" style="display:none"></div>
+  <div class="content" id="tabContent"></div>
+</div>
+
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+//  状态
+// ---------------------------------------------------------------------------
+let TOKEN = localStorage.getItem("ai_proxy_admin_token") || "";
+let CURRENT_USER = "";
+let CONFIG = null;          // 当前编辑中的配置（GET 拿到的脱敏结构）
+let ACTIVE_TAB = "global";
+
+const ENDPOINTS = {
+  login:  "/admin/api/login",
+  logout: "/admin/api/logout",
+  config: "/admin/api/config",
+  stats:  "/admin/api/stats",
+  statsDaily: "/admin/api/stats/daily",
+  providerModels: "/admin/api/provider-models",
+};
+
+// ---------------------------------------------------------------------------
+//  API 封装
+// ---------------------------------------------------------------------------
+async function api(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers || {});
+  if (TOKEN) headers["X-Admin-Token"] = TOKEN;
+  if (opts.body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+  const resp = await fetch(path, {
+    method: opts.method || "GET",
+    headers,
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  if (resp.status === 401) {
+    // token 失效，回到登录页
+    TOKEN = "";
+    localStorage.removeItem("ai_proxy_admin_token");
+    showLogin();
+    throw new Error("未认证或会话已过期");
+  }
+  if (resp.status === 204) return null;
+  const text = await resp.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch (e) { data = { raw: text }; }
+  if (!resp.ok) {
+    const msg = (data && (data.detail || data.error)) || `HTTP ${resp.status}`;
+    const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    err.data = data;
+    err.status = resp.status;
+    throw err;
+  }
+  return data;
+}
+
+function toast(msg, isError = false) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.className = "toast" + (isError ? " error" : "");
+  el.style.display = "block";
+  setTimeout(() => { el.style.display = "none"; }, 3000);
+}
+
+function showError(boxId, msg) {
+  const el = document.getElementById(boxId);
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = "block";
+}
+
+// ---------------------------------------------------------------------------
+//  登录 / 登出
+// ---------------------------------------------------------------------------
+function showLogin() {
+  document.getElementById("loginView").style.display = "flex";
+  document.getElementById("appView").style.display = "none";
+}
+
+function showApp() {
+  document.getElementById("loginView").style.display = "none";
+  document.getElementById("appView").style.display = "block";
+  document.getElementById("topUser").textContent = "👤 " + CURRENT_USER;
+  loadConfig();
+}
+
+async function doLogin() {
+  const username = document.getElementById("loginUser").value.trim();
+  const password = document.getElementById("loginPass").value;
+  const errBox = document.getElementById("loginError");
+  errBox.style.display = "none";
+  try {
+    const data = await api(ENDPOINTS.login, {
+      method: "POST",
+      body: { username, password },
+    });
+    TOKEN = data.token;
+    CURRENT_USER = data.username;
+    localStorage.setItem("ai_proxy_admin_token", TOKEN);
+    showApp();
+  } catch (e) {
+    showError("loginError", e.message);
+  }
+}
+
+async function doLogout() {
+  try { await api(ENDPOINTS.logout, { method: "POST" }); } catch (e) {}
+  TOKEN = "";
+  localStorage.removeItem("ai_proxy_admin_token");
+  showLogin();
+}
+
+// 启动时若有 token，尝试拉配置验证有效性
+async function bootstrap() {
+  if (!TOKEN) { showLogin(); return; }
+  try {
+    const cfg = await api(ENDPOINTS.config);
+    CONFIG = cfg;
+    showApp();
+  } catch (e) {
+    showLogin();
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  加载配置
+// ---------------------------------------------------------------------------
+async function loadConfig() {
+  try {
+    CONFIG = await api(ENDPOINTS.config);
+    ROUTE_MODEL_CACHE = {};  // 配置可能已变，清空模型下拉缓存
+    renderTab();
+  } catch (e) {
+    toast("加载配置失败: " + e.message, true);
+  }
+}
+
+// ---------------------------------------------------------------------------
+//  Tab 切换
+// ---------------------------------------------------------------------------
+// 注意：tab 切换只在文件末尾绑定一次（绑定前要先 syncCurrentTabToConfig）。
+// 这里不要再 addEventListener —— 它不会被后面的 el.onclick 覆盖，两个监听器会同时
+// 触发，每次切 tab 都跑两遍 renderTab()（统计 tab 会因此发两次请求）。
+
+function renderTab() {
+  const c = document.getElementById("tabContent");
+  if (ACTIVE_TAB === "global") c.innerHTML = renderGlobal();
+  else if (ACTIVE_TAB === "providers") c.innerHTML = renderProviders();
+  else if (ACTIVE_TAB === "routes") c.innerHTML = renderRoutes();
+  else if (ACTIVE_TAB === "tenants") c.innerHTML = renderTenants();
+  else if (ACTIVE_TAB === "stats") { c.innerHTML = renderStats(); loadStats(); }
+  bindTabEvents();
+}
+
+// ---------------------------------------------------------------------------
+//  Tab: 全局参数
+// ---------------------------------------------------------------------------
+function renderGlobal() {
+  const c = CONFIG;
+  const providerIds = (c.providers || []).map(p => p.id).filter(Boolean);
+  const def = c.default_provider || (providerIds[0] || "");
+  const opts = providerIds.map(id => `<option value="${id}" ${id===def?"selected":""}>${id}</option>`).join("");
+  return `
+    <div class="card">
+      <div class="card-head"><h3>基本参数</h3></div>
+      <div class="grid-2">
+        <div class="field">
+          <label>日志级别 (log_level)</label>
+          <select id="g_log_level">
+            <option ${c.log_level==="INFO"?"selected":""}>INFO</option>
+            <option ${c.log_level==="DEBUG"?"selected":""}>DEBUG</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>默认 Provider (default_provider)</label>
+          <select id="g_default_provider">${opts}</select>
+        </div>
+        <div class="field">
+          <label>请求体上限 (max_body_size, 字节)</label>
+          <input id="g_max_body_size" type="number" value="${c.max_body_size ?? 15728640}">
+        </div>
+        <div class="field">
+          <label>统计数据库路径 (stats_db)</label>
+          <input id="g_stats_db" type="text" value="${c.stats_db ?? "./stats.db"}">
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>超时配置 (timeouts, 秒)</h3></div>
+      <div class="grid-4">
+        ${["connect","read","write","pool"].map(k => `
+          <div class="field">
+            <label>${k}</label>
+            <input id="g_to_${k}" type="number" step="0.1" value="${(c.timeouts && c.timeouts[k]) ?? ""}">
+          </div>`).join("")}
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>管理认证 (admin)</h3></div>
+      ${c.admin ? `
+        <div class="grid-2">
+          <div class="field">
+            <label>用户名</label>
+            <input id="g_admin_user" type="text" value="${c.admin.username}">
+          </div>
+          <div class="field">
+            <label>密码（显示为掩码，留空或保持掩码表示不改）</label>
+            <input id="g_admin_pass" type="text" value="${c.admin.password || c.admin.password_hash || ""}">
+          </div>
+        </div>
+        <div class="hint">密码以掩码回显。如需修改请输入新明文；保持掩码原样则不改动。</div>
+      ` : `<div class="empty">未配置 [admin] 段。手动在 config.toml 添加 [admin] 段并重启后即可启用管理认证。</div>`}
+    </div>
+  `;
+}
+
+function collectGlobal() {
+  const out = {
+    log_level: document.getElementById("g_log_level").value,
+    default_provider: document.getElementById("g_default_provider").value,
+    max_body_size: parseInt(document.getElementById("g_max_body_size").value, 10) || 15728640,
+    stats_db: document.getElementById("g_stats_db").value.trim() || "./stats.db",
+    timeouts: {
+      connect: parseFloat(document.getElementById("g_to_connect").value) || 5.0,
+      read: parseFloat(document.getElementById("g_to_read").value) || 300.0,
+      write: parseFloat(document.getElementById("g_to_write").value) || 20.0,
+      pool: parseFloat(document.getElementById("g_to_pool").value) || 10.0,
+    },
+  };
+  const adminUserEl = document.getElementById("g_admin_user");
+  if (adminUserEl) {
+    const pass = document.getElementById("g_admin_pass").value;
+    const admin = { username: adminUserEl.value.trim() };
+    if (pass && pass.includes("***")) {
+      // 掩码，保持原值
+      if (CONFIG.admin && CONFIG.admin.password) admin.password = pass;
+      else if (CONFIG.admin && CONFIG.admin.password_hash) admin.password_hash = CONFIG.admin.password_hash;
+    } else if (pass) {
+      admin.password = pass;
+    } else if (CONFIG.admin) {
+      // 空值，保留原凭据
+      if (CONFIG.admin.password) admin.password = CONFIG.admin.password;
+      else if (CONFIG.admin.password_hash) admin.password_hash = CONFIG.admin.password_hash;
+    }
+    out.admin = admin;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+//  Tab: Providers
+// ---------------------------------------------------------------------------
+function renderProviders() {
+  const list = CONFIG.providers || [];
+  const cards = list.map((p, i) => {
+    const openai = p.openai || null;
+    const anthropic = p.anthropic || null;
+    return `
+      <div class="card" data-idx="${i}">
+        <div class="card-head">
+          <h3>${p.id ? escapeHtml(p.id) : "<新 provider>"}</h3>
+          <button class="danger sm" data-act="del-provider" data-idx="${i}">删除</button>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label>ID</label>
+            <input data-field="id" data-idx="${i}" type="text" value="${escapeAttr(p.id || "")}">
+          </div>
+          <div class="field">
+            <label>共享 API Key（两协议共用；留空则各子表单独配置）</label>
+            <input data-field="shared_key" data-idx="${i}" type="text" value="${escapeAttr(p.api_key || "")}" placeholder="掩码或留空">
+          </div>
+        </div>
+        <div class="field">
+          <label>模型列表 models（可选，每行一个；配置后代替该 provider 的 /models 自动发现）</label>
+          <textarea data-field="models" data-idx="${i}" rows="4"
+                    placeholder="适用于不提供 /models 接口的上游（如火山方舟）。留空则通过 /models 自动发现。">${escapeHtml((p.models || []).join("\n"))}</textarea>
+        </div>
+        ${renderEndpoint("openai", i, openai)}
+        ${renderEndpoint("anthropic", i, anthropic)}
+      </div>
+    `;
+  }).join("");
+  return cards + `
+    <button class="ghost" data-act="add-provider">+ 添加 Provider</button>
+  `;
+}
+
+function renderEndpoint(proto, idx, ep) {
+  const has = !!ep;
+  const authStyles = ["bearer", "anthropic", "none"];
+  const authOpts = authStyles.map(s =>
+    `<option value="${s}" ${ep && ep.auth_style===s?"selected":""}>${s}</option>`).join("");
+  return `
+    <div style="margin-top:14px; padding:14px; background:var(--panel-2); border-radius:6px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+        <strong style="color:var(--text-dim)">${proto}</strong>
+        <span class="badge ${has?"on":""}">${has?"已配置":"未配置"}</span>
+      </div>
+      ${has ? `
+        <div class="grid-3">
+          <div class="field" style="grid-column:span 2">
+            <label>base_url</label>
+            <input data-field="ep_base" data-idx="${idx}" data-proto="${proto}" type="text" value="${escapeAttr(ep.base_url || "")}">
+          </div>
+          <div class="field">
+            <label>auth_style</label>
+            <select data-field="ep_auth" data-idx="${idx}" data-proto="${proto}">${authOpts}</select>
+          </div>
+          <div class="field" style="grid-column:span 3">
+            <label>api_key（留空则继承共享 key）</label>
+            <input data-field="ep_key" data-idx="${idx}" data-proto="${proto}" type="text" value="${escapeAttr(ep.api_key || "")}" placeholder="掩码或留空">
+          </div>
+          <div class="field" style="grid-column:span 3">
+            <label>headers（JSON，可选）</label>
+            <input data-field="ep_headers" data-idx="${idx}" data-proto="${proto}" type="text" value="${ep.headers ? escapeAttr(JSON.stringify(ep.headers)) : ""}" placeholder='{"X-Custom":"foo"}'>
+          </div>
+        </div>
+        <button class="ghost sm" data-act="del-ep" data-idx="${idx}" data-proto="${proto}">移除 ${proto} 端点</button>
+      ` : `
+        <button class="ghost sm" data-act="add-ep" data-idx="${idx}" data-proto="${proto}">+ 添加 ${proto} 端点</button>
+      `}
+    </div>
+  `;
+}
+
+function collectProviders() {
+  const cards = document.querySelectorAll(".card[data-idx]");
+  const out = [];
+  cards.forEach(card => {
+    const i = parseInt(card.dataset.idx, 10);
+    const p = CONFIG.providers[i] || {};
+    const id = (card.querySelector('[data-field="id"]') || {}).value;
+    const sharedKey = (card.querySelector('[data-field="shared_key"]') || {}).value;
+    const item = { id: id ? id.trim() : "" };
+    if (sharedKey && sharedKey.trim()) item.api_key = sharedKey.trim();
+
+    // 手动模型列表：每行一个，去空去重；为空则不写该字段（走 /models 自动发现）
+    const modelsEl = card.querySelector('[data-field="models"]');
+    if (modelsEl) {
+      const models = [...new Set(
+        modelsEl.value.split("\n").map(s => s.trim()).filter(Boolean)
+      )];
+      if (models.length) item.models = models;
+    }
+
+    for (const proto of ["openai", "anthropic"]) {
+      const baseEl = card.querySelector(`[data-field="ep_base"][data-proto="${proto}"]`);
+      if (!baseEl) continue;
+      const sub = { base_url: baseEl.value.trim() };
+      if (!sub.base_url) continue; // 空地址跳过
+      const keyEl = card.querySelector(`[data-field="ep_key"][data-proto="${proto}"]`);
+      if (keyEl && keyEl.value.trim()) sub.api_key = keyEl.value.trim();
+      const authEl = card.querySelector(`[data-field="ep_auth"][data-proto="${proto}"]`);
+      if (authEl) sub.auth_style = authEl.value;
+      const headersEl = card.querySelector(`[data-field="ep_headers"][data-proto="${proto}"]`);
+      if (headersEl && headersEl.value.trim()) {
+        try { sub.headers = JSON.parse(headersEl.value); }
+        catch (e) { /* 忽略非法 JSON，校验会拦 */ }
+      }
+      item[proto] = sub;
+    }
+    out.push(item);
+  });
+  return out;
+}
+
+function bindProviderEvents() {
+  document.querySelectorAll('[data-act="del-provider"]').forEach(b => {
+    b.onclick = () => {
+      const i = parseInt(b.dataset.idx, 10);
+      CONFIG.providers.splice(i, 1);
+      renderTab();
+    };
+  });
+  document.querySelectorAll('[data-act="add-provider"]').forEach(b => {
+    b.onclick = () => {
+      CONFIG.providers.push({ id: "", openai: null, anthropic: null });
+      renderTab();
+    };
+  });
+  document.querySelectorAll('[data-act="add-ep"]').forEach(b => {
+    b.onclick = () => {
+      const i = parseInt(b.dataset.idx, 10);
+      const proto = b.dataset.proto;
+      CONFIG.providers[i][proto] = { base_url: "", api_key: "", auth_style: proto === "openai" ? "bearer" : "anthropic" };
+      renderTab();
+    };
+  });
+  document.querySelectorAll('[data-act="del-ep"]').forEach(b => {
+    b.onclick = () => {
+      const i = parseInt(b.dataset.idx, 10);
+      const proto = b.dataset.proto;
+      CONFIG.providers[i][proto] = null;
+      renderTab();
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+//  Tab: 模型路由
+// ---------------------------------------------------------------------------
+function renderRoutes() {
+  const routes = CONFIG.model_routes || {};
+  const keys = Object.keys(routes);
+  const providerIds = (CONFIG.providers || []).map(p => p.id).filter(Boolean);
+  const rows = keys.map((k, i) => {
+    const r = routes[k];
+    const prov = (r && r.provider) || "";
+    const model = (r && r.model) || "";
+    const opts = providerIds.map(id =>
+      `<option value="${id}" ${id===prov?"selected":""}>${id}</option>`).join("");
+    return `
+      <tr data-idx="${i}">
+        <td><input data-field="r_key" data-idx="${i}" type="text" value="${escapeAttr(k)}"></td>
+        <td><select data-field="r_prov" data-idx="${i}">${opts}</select></td>
+        <td>
+          <select data-field="r_model" data-idx="${i}">
+            <option value="">留空=透传客户端模型名</option>
+            ${model ? `<option value="${escapeAttr(model)}" selected>${escapeHtml(model)}</option>` : ""}
+          </select>
+          <input data-field="r_model_custom" data-idx="${i}" type="text"
+                 placeholder="输入自定义模型名" style="display:none; margin-top:4px;">
+        </td>
+        <td><button class="danger sm" data-act="del-route" data-idx="${i}">删除</button></td>
+      </tr>
+    `;
+  }).join("");
+  return `
+    <div class="card">
+      <div class="card-head"><h3>模型路由 (model_routes)</h3></div>
+      <table>
+        <thead><tr><th>客户端模型名</th><th>Provider</th><th>上游模型名</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="4" class="empty">暂无路由</td></tr>'}</tbody>
+      </table>
+      <div style="margin-top:12px"><button class="ghost sm" data-act="add-route">+ 添加路由</button></div>
+      <div class="hint">选择 Provider 后会自动拉取该 provider 的上游可用模型，可下拉选择，也可选「手动输入…」；留空即透传客户端模型名。在 Providers 中配置了模型列表（models）的 provider 会优先使用该列表。</div>
+    </div>
+  `;
+}
+
+function collectRoutes() {
+  const out = {};
+  document.querySelectorAll("tr[data-idx]").forEach(tr => {
+    const key = tr.querySelector(`[data-field="r_key"]`).value.trim();
+    if (!key) return;
+    const prov = tr.querySelector(`[data-field="r_prov"]`).value;
+    const modelEl = tr.querySelector(`[data-field="r_model"]`);
+    let model = modelEl ? modelEl.value : "";
+    if (model === "__custom__") {
+      const customEl = tr.querySelector(`[data-field="r_model_custom"]`);
+      model = customEl ? customEl.value.trim() : "";
+    } else {
+      model = (model || "").trim();
+    }
+    const entry = { provider: prov };
+    if (model) entry.model = model;
+    out[key] = entry;
+  });
+  return out;
+}
+
+// 上游模型下拉缓存：providerId -> [模型名]
+let ROUTE_MODEL_CACHE = {};
+
+// 工作副本（未保存）里配置了手动模型列表时优先使用
+function providerModelsFromWorkingConfig(providerId) {
+  const p = (CONFIG.providers || []).find(x => x && x.id === providerId);
+  return (p && Array.isArray(p.models) && p.models.length) ? p.models : null;
+}
+
+async function fetchProviderModels(providerId) {
+  if (!providerId) return [];
+  const local = providerModelsFromWorkingConfig(providerId);
+  if (local) return local;
+  if (ROUTE_MODEL_CACHE[providerId]) return ROUTE_MODEL_CACHE[providerId];
+  try {
+    const data = await api(`${ENDPOINTS.providerModels}?provider=${encodeURIComponent(providerId)}`);
+    const models = (data && Array.isArray(data.models)) ? data.models : [];
+    ROUTE_MODEL_CACHE[providerId] = models;
+    return models;
+  } catch (e) {
+    // 拉取失败（如 provider 尚未保存 / 无 openai 端点）时不打断编辑，保留手动输入
+    return [];
+  }
+}
+
+function toggleModelCustom(tr) {
+  const modelEl = tr.querySelector('[data-field="r_model"]');
+  const customEl = tr.querySelector('[data-field="r_model_custom"]');
+  if (!modelEl || !customEl) return;
+  if (modelEl.value === "__custom__") {
+    customEl.style.display = "";
+    customEl.focus();
+  } else {
+    customEl.style.display = "none";
+  }
+}
+
+async function populateModelSelect(i) {
+  const tr = document.querySelector(`tr[data-idx="${i}"]`);
+  if (!tr) return;
+  const provEl = tr.querySelector('[data-field="r_prov"]');
+  const modelEl = tr.querySelector('[data-field="r_model"]');
+  if (!provEl || !modelEl) return;
+
+  const current = modelEl.value;  // 渲染时是已配置的 model；provider 变更时已被重置为空
+  const models = await fetchProviderModels(provEl.value);
+
+  const seen = new Set();
+  const opts = ['<option value="">留空=透传客户端模型名</option>'];
+  for (const m of models) {
+    if (seen.has(m)) continue;
+    seen.add(m);
+    opts.push(`<option value="${escapeAttr(m)}">${escapeHtml(m)}</option>`);
+  }
+  // 保留已配置的值（即使不在上游列表里也不能丢）
+  if (current && !seen.has(current)) {
+    opts.push(`<option value="${escapeAttr(current)}">${escapeHtml(current)}（当前配置）</option>`);
+  }
+  opts.push('<option value="__custom__">手动输入…</option>');
+
+  modelEl.innerHTML = opts.join("");
+  modelEl.value = current || "";
+  modelEl.onchange = () => toggleModelCustom(tr);
+  toggleModelCustom(tr);
+}
+
+function bindRouteEvents() {
+  document.querySelectorAll('[data-act="del-route"]').forEach(b => {
+    b.onclick = () => {
+      const i = parseInt(b.dataset.idx, 10);
+      const key = Object.keys(CONFIG.model_routes)[i];
+      delete CONFIG.model_routes[key];
+      renderTab();
+    };
+  });
+  document.querySelectorAll('[data-act="add-route"]').forEach(b => {
+    b.onclick = () => {
+      if (!CONFIG.model_routes) CONFIG.model_routes = {};
+      CONFIG.model_routes["new-model"] = { provider: (CONFIG.providers[0]||{}).id || "" };
+      renderTab();
+    };
+  });
+
+  // 选择 provider 后，重置模型并自动拉取该 provider 的上游模型填充下拉
+  document.querySelectorAll('[data-field="r_prov"]').forEach(sel => {
+    sel.onchange = () => {
+      const i = parseInt(sel.dataset.idx, 10);
+      const tr = document.querySelector(`tr[data-idx="${i}"]`);
+      if (tr) {
+        const modelEl = tr.querySelector('[data-field="r_model"]');
+        if (modelEl) modelEl.value = "";
+        const customEl = tr.querySelector('[data-field="r_model_custom"]');
+        if (customEl) { customEl.value = ""; customEl.style.display = "none"; }
+      }
+      populateModelSelect(i);
+    };
+  });
+
+  // 初次渲染时，按当前已选 provider 填充下拉
+  document.querySelectorAll("tr[data-idx]").forEach(tr => {
+    populateModelSelect(parseInt(tr.dataset.idx, 10));
+  });
+}
+
+// ---------------------------------------------------------------------------
+//  Tab: 租户
+// ---------------------------------------------------------------------------
+function renderTenants() {
+  const list = CONFIG.tenants || [];
+  const rows = list.map((t, i) => `
+    <tr data-idx="${i}">
+      <td><input data-field="t_id" data-idx="${i}" type="text" value="${escapeAttr(t.id||"")}"></td>
+      <td><input data-field="t_name" data-idx="${i}" type="text" value="${escapeAttr(t.name||"")}"></td>
+      <td><input data-field="t_key" data-idx="${i}" type="text" value="${escapeAttr(t.api_key||"")}"></td>
+      <td>
+        <select data-field="t_status" data-idx="${i}">
+          <option ${t.status==="active"?"selected":""}>active</option>
+          <option ${t.status==="disabled"?"selected":""}>disabled</option>
+        </select>
+      </td>
+      <td><button class="danger sm" data-act="del-tenant" data-idx="${i}">删除</button></td>
+    </tr>
+  `).join("");
+  return `
+    <div class="card">
+      <div class="card-head"><h3>租户 (tenants)</h3></div>
+      <table>
+        <thead><tr><th>ID</th><th>名称</th><th>API Key</th><th>状态</th><th></th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="5" class="empty">暂无租户</td></tr>'}</tbody>
+      </table>
+      <div style="margin-top:12px"><button class="ghost sm" data-act="add-tenant">+ 添加租户</button></div>
+      <div class="hint">API Key 以掩码回显；输入新值可修改，保持掩码原样则不改。</div>
+    </div>
+  `;
+}
+
+function collectTenants() {
+  const out = [];
+  document.querySelectorAll("tr[data-idx]").forEach(tr => {
+    const id = tr.querySelector('[data-field="t_id"]').value.trim();
+    if (!id) return;
+    out.push({
+      id,
+      name: tr.querySelector('[data-field="t_name"]').value.trim(),
+      api_key: tr.querySelector('[data-field="t_key"]').value.trim(),
+      status: tr.querySelector('[data-field="t_status"]').value,
+    });
+  });
+  return out;
+}
+
+function bindTenantEvents() {
+  document.querySelectorAll('[data-act="del-tenant"]').forEach(b => {
+    b.onclick = () => {
+      const i = parseInt(b.dataset.idx, 10);
+      CONFIG.tenants.splice(i, 1);
+      renderTab();
+    };
+  });
+  document.querySelectorAll('[data-act="add-tenant"]').forEach(b => {
+    b.onclick = () => {
+      CONFIG.tenants.push({ id: "", name: "", api_key: "", status: "active" });
+      renderTab();
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+//  Tab: 用量统计
+//
+//  顶部一行筛选器统管下面所有内容（KPI + 图表 / 表格）；切视图不重新请求，
+//  三种视图都从同一份 STATS_DATA 渲染。
+// ---------------------------------------------------------------------------
+
+const STATS_METRICS = [
+  { key: "total_tokens",  label: "总 Token" },
+  { key: "request_count", label: "请求数" },
+  { key: "input_tokens",  label: "输入 Token" },
+  { key: "output_tokens", label: "输出 Token" },
+];
+
+const STATS_VIEWS = [
+  { key: "stacked", label: "堆叠柱状图" },
+  { key: "line",    label: "折线图" },
+  { key: "table",   label: "表格" },
+];
+
+const STATS_PRESETS = [
+  { key: "7",   label: "近 7 天",  days: 7 },
+  { key: "30",  label: "近 30 天", days: 30 },
+  { key: "90",  label: "近 90 天", days: 90 },
+  { key: "all", label: "全部",     days: null },
+];
+
+let STATS_STATE = {
+  metric: "total_tokens",
+  view: "stacked",
+  preset: "30",
+  since: "",
+  until: "",
+  bucket: "",          // 空 = 按区间跨度自动决定
+  provider: "",        // 空 = 全部厂商
+  hidden: new Set(),   // 被图例点掉的序列 key
+};
+let STATS_DATA = null;         // /admin/api/stats/daily 的响应
+let STATS_CHART_SERIES = [];   // 折叠后的绘图序列（含「其他」），图表/图例/tooltip 共用
+let STATS_SUMMARY = null;      // 表格视图的模型汇总（懒加载）
+let STATS_RO = null;           // ResizeObserver，切 tab 时先断开
+let STATS_REQ = 0;             // 请求序号，用来丢弃过期响应
+let STATS_PROVIDER_SIG = "";   // 已渲染的厂商列表签名，避免每次响应都重建下拉框
+
+// 分类色板容量。超出后一律用中性灰，绝不生成第 8 种色（生成出来的色在色盲视角下
+// 跟已有槽位分不开）。
+const SERIES_SLOTS = 7;
+
+// 模型 -> 槽位。由服务端给的「全时段用量排名」推导，而不是按当前区间的排名：
+// 按区间排名分配的话，换个时间范围排名一变，同一个模型就被涂成另一个颜色，
+// 而读者一旦记住「deepseek-flash 是蓝色」，看它变色就是被误导。
+// 用全时段排名，配色在切换区间时天然稳定，且排名前 7 名的模型总是拿到颜色。
+let SERIES_SLOT = new Map();
+
+function setModelRank(rank) {
+  if (!Array.isArray(rank) || !rank.length) return;
+  SERIES_SLOT = new Map(rank.map((m, i) => [m, i < SERIES_SLOTS ? i : -1]));
+}
+
+/**
+ * 用服务端给的全时段厂商列表填充厂商下拉框。
+ *
+ * 列表是跟着响应回来的（第一次请求才知道有哪些厂商），所以这里做的是原地更新，
+ * 而不是重渲染整行筛选器 —— 重渲染会打断用户正在操作的下拉框。
+ */
+function setProviderOptions(rank) {
+  if (!Array.isArray(rank) || !rank.length) return;   // 空库：保留「全部厂商」一项
+  const cur = STATS_STATE.provider;
+  // 选中的厂商必须留在列表里，否则下拉框会显示空白，而数据其实是过滤过的
+  const opts = (cur && !rank.includes(cur)) ? [cur, ...rank] : rank;
+  const sig = opts.join(" ");
+  if (sig === STATS_PROVIDER_SIG) return;
+  STATS_PROVIDER_SIG = sig;
+
+  const sel = document.getElementById("s_provider");
+  if (!sel) return;
+  sel.innerHTML = `<option value="">全部厂商</option>` + opts.map(p =>
+    `<option value="${escapeAttr(p)}">${escapeHtml(p)}</option>`).join("");
+  sel.value = cur;
+}
+
+/** 模型 -> CSS 颜色。不在全时段前 7 名（或未知模型）一律中性灰。 */
+function seriesColor(key) {
+  if (key === "其他") return "var(--series-other)";
+  const slot = SERIES_SLOT.get(key);
+  return (slot === undefined || slot < 0) ? "var(--series-other)" : `var(--series-${slot + 1})`;
+}
+
+/** 排序权重：有色槽位的按槽位，其余一律排到最后 */
+function slotOf(key) {
+  if (key === "其他") return SERIES_SLOTS;
+  const s = SERIES_SLOT.get(key);
+  return (s === undefined || s < 0) ? SERIES_SLOTS + 1 : s;
+}
+
+/**
+ * 把长尾折叠成一条「其他」，并让堆叠顺序跟着全时段排名走。
+ *
+ * 色板只有 7 个槽位，第 8 个模型开始只能拿中性灰 —— 若照旧逐个列进图例，就会出现
+ * 一堆同色的灰块，等于没有区分度。规则是「绝不生成第 8 种色」，所以拿不到槽位的
+ * 模型一律折叠进「其他」。
+ *
+ * 排序也按全时段排名（而不是当前区间的用量）：这样切换筛选条件时，堆叠顺序和配色
+ * 都不变，同一个模型永远在同一条色带位置上。
+ */
+function foldSeries(series, buckets) {
+  const ordered = series.slice().sort((a, b) => slotOf(a.key) - slotOf(b.key));
+  const named = ordered.filter(s => slotOf(s.key) <= SERIES_SLOTS - 1);
+  const tail = ordered.slice(named.length);
+  if (!tail.length) return named;
+  const values = buckets.map((_, i) => tail.reduce((a, s) => a + (s.values[i] || 0), 0));
+  return named.concat([{
+    key: "其他",
+    total: tail.reduce((a, s) => a + s.total, 0),
+    values,
+    folded: tail.map(s => s.key),
+  }]);
+}
+
+// ---- 数值/日期格式化 ----
+
+function isoDate(d) {
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+function compactNum(v) {
+  try {
+    return new Intl.NumberFormat("zh-CN", { notation: "compact", maximumFractionDigits: 1 }).format(v);
+  } catch (e) { return String(Math.round(v)); }
+}
+
+function fullNum(v) {
+  return new Intl.NumberFormat("zh-CN").format(Math.round(v || 0));
+}
+
+/** 把接口返回的 ISO 时间戳压成 "MM-DD HH:mm"（同一年时省略年份） */
+function fmtTs(ts) {
+  if (!ts) return "";
+  const m = String(ts).match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  if (!m) return ts;
+  const sameYear = m[1] === String(new Date().getFullYear());
+  return sameYear ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}` : `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}`;
+}
+
+/** x 轴刻度：日 -> MM-DD，周 -> W35，月 -> YYYY-MM */
+function shortBucket(b) {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(b)) return b.slice(5);
+  if (/^\d{4}-W\d{2}$/.test(b)) return b.slice(6);
+  return b;
+}
+
+/**
+ * 选 y 轴刻度步长，让刻度落在整数上、且上界不至于浪费太多空间。
+ *
+ * 先把 max/ticks 归到最近的 1/2/2.5/5 × 10ⁿ，再乘回去当上界。直接对最大值取整到
+ * 1/2/5 是不行的：峰值 2809 会被抬到 5000，最高的柱子只占轴的 56%，而且刻度变成
+ * 0/1250/2500/3750/5000 —— 不如 0/1000/2000/3000/4000 好读。
+ */
+function axisScale(max, ticks = 4) {
+  if (!(max > 0)) return { yMax: 1, step: 0.25 };
+  const raw = max / ticks;
+  const base = Math.pow(10, Math.floor(Math.log10(raw)));
+  const n = raw / base;
+  const mult = n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10;
+  const step = mult * base;
+  return { yMax: step * ticks, step };
+}
+
+// ---- 区间与分桶 ----
+
+function presetRange(key) {
+  const p = STATS_PRESETS.find(x => x.key === key);
+  if (!p || !p.days) return { since: "", until: "" };
+  const today = new Date();
+  const from = new Date(today);
+  from.setDate(from.getDate() - (p.days - 1));
+  return { since: isoDate(from), until: isoDate(today) };
+}
+
+function spanDays(since, until) {
+  if (!since || !until) return null;
+  const a = new Date(since + "T00:00:00");
+  const b = new Date(until + "T00:00:00");
+  if (isNaN(a) || isNaN(b)) return null;
+  return Math.round((b - a) / 86400000);
+}
+
+/** 区间过宽时降级分桶粒度，否则柱子会细到看不清 */
+function bucketForSpan(days) {
+  if (days === null) return "day";   // 跨度未知，先用日，拿到 period 再定
+  if (days > 730) return "month";
+  if (days > 92) return "week";
+  return "day";
+}
+
+function currentBucket() {
+  return STATS_STATE.bucket || bucketForSpan(spanDays(STATS_STATE.since, STATS_STATE.until));
+}
+
+// ---- 渲染 ----
+
+function renderStats() {
+  const st = STATS_STATE;
+  return `
+    <div class="card">
+      <div class="filter-row">
+        <div class="field">
+          <label>时间范围</label>
+          <div class="preset-group" id="s_presets">
+            ${STATS_PRESETS.map(p =>
+              `<button data-preset="${p.key}" class="${st.preset === p.key ? "active" : ""}">${p.label}</button>`
+            ).join("")}
+          </div>
+        </div>
+        <div class="field">
+          <label>自定义区间（会覆盖上面的预设）</label>
+          <div class="range-inputs">
+            <input id="s_since" type="date" value="${escapeAttr(st.since)}">
+            <span>~</span>
+            <input id="s_until" type="date" value="${escapeAttr(st.until)}">
+          </div>
+        </div>
+        <div class="field">
+          <label>厂商</label>
+          <select id="s_provider">
+            <option value="">全部厂商</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>指标</label>
+          <select id="s_metric">
+            ${STATS_METRICS.map(m =>
+              `<option value="${m.key}" ${st.metric === m.key ? "selected" : ""}>${m.label}</option>`
+            ).join("")}
+          </select>
+        </div>
+        <div class="field">
+          <label>视图</label>
+          <select id="s_view">
+            ${STATS_VIEWS.map(v =>
+              `<option value="${v.key}" ${st.view === v.key ? "selected" : ""}>${v.label}</option>`
+            ).join("")}
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="grid-4" id="s_kpi" style="margin-bottom:16px"></div>
+    <div class="card" id="s_card">
+      <div class="card-head">
+        <h3 id="s_title">每日用量</h3>
+        <span class="hint" id="s_period"></span>
+      </div>
+      <div id="s_body"><div class="empty">加载中...</div></div>
+    </div>
+  `;
+}
+
+function loadStats() {
+  const st = STATS_STATE;
+
+  document.querySelectorAll("#s_presets button").forEach(btn => {
+    btn.onclick = () => {
+      st.preset = btn.dataset.preset;
+      const r = presetRange(st.preset);
+      st.since = r.since;
+      st.until = r.until;
+      st.hidden.clear();
+      document.querySelectorAll("#s_presets button").forEach(b =>
+        b.classList.toggle("active", b === btn));
+      document.getElementById("s_since").value = st.since;
+      document.getElementById("s_until").value = st.until;
+      fetchStats();
+    };
+  });
+
+  document.getElementById("s_since").onchange = e => {
+    st.since = e.target.value;
+    st.preset = "";
+    document.querySelectorAll("#s_presets button").forEach(b => b.classList.remove("active"));
+    fetchStats();
+  };
+  document.getElementById("s_until").onchange = e => {
+    st.until = e.target.value;
+    st.preset = "";
+    document.querySelectorAll("#s_presets button").forEach(b => b.classList.remove("active"));
+    fetchStats();
+  };
+  document.getElementById("s_metric").onchange = e => {
+    st.metric = e.target.value;
+    fetchStats();
+  };
+  document.getElementById("s_provider").onchange = e => {
+    st.provider = e.target.value;
+    // 厂商一换，画的是另一批模型了；上一批的图例显隐状态留着只会让人困惑
+    st.hidden.clear();
+    fetchStats();
+  };
+  document.getElementById("s_view").onchange = e => {
+    st.view = e.target.value;
+    renderStatsBody();          // 切视图不重新请求
+  };
+
+  // 首次进入时把预设落到具体区间上：否则按钮高亮着「近 30 天」，拿到的却是全部数据
+  if (!st.since && !st.until && st.preset) {
+    const r = presetRange(st.preset);
+    st.since = r.since;
+    st.until = r.until;
+    document.getElementById("s_since").value = st.since;
+    document.getElementById("s_until").value = st.until;
+  }
+
+  // 窗口/容器宽度变化后重绘（SVG 是按当前像素宽画的）
+  if (STATS_RO) STATS_RO.disconnect();
+  const body = document.getElementById("s_body");
+  if (body && typeof ResizeObserver !== "undefined") {
+    let timer = null;
+    STATS_RO = new ResizeObserver(() => {
+      if (STATS_STATE.view === "table") return;
+      clearTimeout(timer);
+      timer = setTimeout(renderStatsBody, 120);
+    });
+    STATS_RO.observe(body);
+  }
+
+  fetchStats();
+}
+
+async function fetchStats() {
+  const card = document.getElementById("s_card");
+  if (card) card.classList.add("is-refreshing");   // 按住上一帧，不闪骨架、不跳布局
+
+  // 连点预设时会有多个请求在飞。全量区间（全部）比窄区间（近 7 天）扫的行多、
+  // 更慢，很容易后发先至；不认领请求序号的话，先发的那次回来会把新结果覆盖掉，
+  // 界面就会「按钮选的全部、数据是近 7 天」。
+  const seq = ++STATS_REQ;
+  try {
+    const params = new URLSearchParams();
+    params.set("metric", STATS_STATE.metric);
+    params.set("bucket", currentBucket());
+    if (STATS_STATE.since) params.set("since", STATS_STATE.since);
+    if (STATS_STATE.until) params.set("until", STATS_STATE.until);
+    if (STATS_STATE.provider) params.set("provider", STATS_STATE.provider);
+
+    let data = await api(`${ENDPOINTS.statsDaily}?${params}`);
+
+    // 「全部」区间事先不知道跨度，拿到 period 后按实际跨度决定粒度，必要时重取一次
+    if (!STATS_STATE.bucket) {
+      const want = bucketForSpan(spanDays(
+        (data.period || {}).since ? data.period.since.slice(0, 10) : "",
+        (data.period || {}).until ? data.period.until.slice(0, 10) : "",
+      ));
+      if (want !== data.bucket) {
+        params.set("bucket", want);
+        data = await api(`${ENDPOINTS.statsDaily}?${params}`);
+      }
+    }
+
+    if (seq !== STATS_REQ) return;   // 已经有更新的请求了，丢掉这次结果
+    STATS_DATA = data;
+    STATS_SUMMARY = null;
+    renderStatsBody();
+  } catch (e) {
+    if (seq !== STATS_REQ) return;
+    const body = document.getElementById("s_body");
+    if (body) body.innerHTML = `<div class="error-box">${escapeHtml(e.message)}</div>`;
+  } finally {
+    if (seq === STATS_REQ) {
+      const c = document.getElementById("s_card");
+      if (c) c.classList.remove("is-refreshing");
+    }
+  }
+}
+
+function renderStatsBody() {
+  const data = STATS_DATA;
+  const kpi = document.getElementById("s_kpi");
+  const body = document.getElementById("s_body");
+  const title = document.getElementById("s_title");
+  const period = document.getElementById("s_period");
+  if (!body || !data) return;
+
+  setModelRank(data.model_rank);
+  setProviderOptions(data.provider_rank);
+  const buckets = data.buckets || [];
+  const allSeries = data.series || [];
+  // 图上不画恒为 0 的序列（它对当前指标没有任何贡献），但表格里保留
+  const active = allSeries.filter(s => s.total > 0 || s.values.some(v => v > 0));
+  const zeroCount = allSeries.length - active.length;
+  STATS_CHART_SERIES = foldSeries(active, buckets);
+
+  const metricLabel = (STATS_METRICS.find(m => m.key === data.metric) || {}).label || data.metric;
+  const p = data.period || {};
+  if (period) {
+    const span = p.since ? `${fmtTs(p.since)} ~ ${fmtTs(p.until)}` : "";
+    const extra = zeroCount > 0 ? `　|　另有 ${zeroCount} 个模型该指标为 0，未在图中显示` : "";
+    period.textContent = span + extra;
+  }
+  if (kpi) kpi.innerHTML = renderKpi(data, buckets, active, STATS_CHART_SERIES);
+  if (title) {
+    // 把当前厂商写进标题：单看一张图分不出这是全量还是某个厂商，截图/导出后就说不清了
+    const scope = STATS_STATE.provider ? ` · ${STATS_STATE.provider}` : "";
+    title.textContent =
+      (STATS_STATE.view === "table" ? "每日明细" : `每日用量 · ${metricLabel}`) + scope;
+  }
+
+  if (!buckets.length) {
+    body.innerHTML = '<div class="empty">该时间范围内没有数据</div>';
+    return;
+  }
+
+  if (STATS_STATE.view === "table") {
+    body.innerHTML = renderStatsTables(data, allSeries);
+    loadStatsSummary();
+    return;
+  }
+
+  const legend = STATS_CHART_SERIES;
+  const visible = legend.filter(s => !STATS_STATE.hidden.has(s.key));
+  if (!visible.length) {
+    body.innerHTML = '<div class="empty">所有序列都被隐藏了，点击下方图例恢复</div>'
+      + renderLegend(legend);
+    bindChartEvents();
+    return;
+  }
+  body.innerHTML =
+    (STATS_STATE.view === "line" ? renderLineChart(data, visible) : renderStackedChart(data, visible))
+    + renderLegend(legend);
+  bindChartEvents();
+}
+
+function renderKpi(data, buckets, active, chartSeries) {
+  const t = data.totals || {};
+  const n = buckets.length || 1;
+  const unit = data.bucket === "month" ? "月" : data.bucket === "week" ? "周" : "天";
+  const perBucket = (t.total_tokens || 0) / n;
+
+  let peak = { v: 0, at: "" };
+  buckets.forEach((b, i) => {
+    const v = active.reduce((a, s) => a + (s.values[i] || 0), 0);
+    if (v > peak.v) peak = { v, at: b };
+  });
+
+  const foldedNote = chartSeries.some(s => s.folded)
+    ? `图中 ${chartSeries.length - 1} 个 + 其他`
+    : `图中显示 ${active.length} 个`;
+
+  const metricLabel = (STATS_METRICS.find(m => m.key === data.metric) || {}).label || data.metric;
+
+  const tile = (k, v, sub) => `
+    <div class="stat-tile">
+      <div class="k">${escapeHtml(k)}</div>
+      <div class="v">${v}</div>
+      ${sub ? `<div class="sub">${escapeHtml(sub)}</div>` : ""}
+    </div>`;
+
+  return tile("总请求数", fullNum(t.request_count), `${n} ${unit}`)
+    + tile("总 Token", fullNum(t.total_tokens), `${unit}均 ${fullNum(perBucket)}`)
+    // 峰值的标题带上指标名：它跟着上面选的指标走，不写清楚会跟左边的总 Token 串味
+    + tile(`${metricLabel} 峰值`, peak.v ? compactNum(peak.v) : "—",
+           peak.at ? shortBucket(peak.at) : "无数据")
+    + tile("活跃模型数", fullNum(t.active_models), foldedNote);
+}
+
+function renderStatsTables(data, series) {
+  const buckets = data.buckets;
+
+  // 每日明细：桶 × 模型
+  const head = `<th>日期</th>` + series.map(s =>
+    `<th style="text-align:right">${escapeHtml(s.key)}</th>`).join("") +
+    `<th style="text-align:right">合计</th>`;
+  const rows = buckets.map((b, i) => {
+    const total = series.reduce((a, s) => a + (s.values[i] || 0), 0);
+    return `<tr><td class="mono">${escapeHtml(b)}</td>`
+      + series.map(s => `<td class="mono" style="text-align:right">${fullNum(s.values[i])}</td>`).join("")
+      + `<td class="mono" style="text-align:right"><b>${fullNum(total)}</b></td></tr>`;
+  }).join("");
+
+  return `
+    <div class="tbl-scroll">
+      <table>
+        <thead><tr>${head}</tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    <div class="card-head" style="margin:24px 0 14px"><h3>模型汇总（区间内）</h3></div>
+    <div id="s_summary"><div class="empty">加载中...</div></div>
+  `;
+}
+
+async function loadStatsSummary() {
+  const box = document.getElementById("s_summary");
+  if (!box) return;
+  if (STATS_SUMMARY) { renderStatsSummary(box); return; }
+  try {
+    const params = new URLSearchParams({ group_by: "model" });
+    if (STATS_STATE.since) params.set("since", STATS_STATE.since);
+    if (STATS_STATE.until) params.set("until", STATS_STATE.until);
+    if (STATS_STATE.provider) params.set("provider", STATS_STATE.provider);
+    STATS_SUMMARY = await api(`${ENDPOINTS.stats}?${params}`);
+    renderStatsSummary(box);
+  } catch (e) {
+    box.innerHTML = `<div class="error-box">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderStatsSummary(box) {
+  const stats = (STATS_SUMMARY || {}).stats || [];
+  if (!stats.length) { box.innerHTML = '<div class="empty">无统计数据</div>'; return; }
+  const rows = stats.map(s => `
+    <tr>
+      <td style="white-space:nowrap"><span class="swatch" style="display:inline-block;vertical-align:middle;margin-right:6px;background:${seriesColor(s.model)}"></span>${escapeHtml(s.model)}</td>
+      <td class="mono" style="text-align:right">${fullNum(s.request_count)}</td>
+      <td class="mono" style="text-align:right">${fullNum(s.input_tokens)}</td>
+      <td class="mono" style="text-align:right">${fullNum(s.output_tokens)}</td>
+      <td class="mono" style="text-align:right">${fullNum(s.cache_read_tokens)}</td>
+      <td class="mono" style="text-align:right">${fullNum(s.cache_creation_tokens)}</td>
+      <td class="mono" style="text-align:right"><b>${fullNum(s.total_tokens)}</b></td>
+    </tr>`).join("");
+  box.innerHTML = `
+    <div class="tbl-scroll">
+      <table>
+        <thead><tr>
+          <th>模型</th><th style="text-align:right">请求数</th><th style="text-align:right">输入</th>
+          <th style="text-align:right">输出</th><th style="text-align:right">缓存读</th>
+          <th style="text-align:right">缓存写</th><th style="text-align:right">合计</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
+// ---- 图表几何 ----
+
+const CHART = { h: 300, padL: 56, padR: 16, padT: 16, padB: 28, gap: 2 };
+
+/** 顶部两角圆角、底部贴基线的矩形路径（4px 圆角数据端） */
+function barPath(x, yTop, w, hgt, r) {
+  if (hgt <= 0 || w <= 0) return "";
+  const rr = Math.max(0, Math.min(r, w / 2, hgt));
+  const x2 = x + w, y2 = yTop + hgt;
+  if (rr <= 0.5) return `M${x},${yTop} h${w} v${hgt} h${-w} Z`;
+  return `M${x},${y2} V${yTop + rr} Q${x},${yTop} ${x + rr},${yTop} ` +
+         `H${x2 - rr} Q${x2},${yTop} ${x2},${yTop + rr} V${y2} Z`;
+}
+
+function n1(v) { return Math.round(v * 10) / 10; }
+
+/** 网格线 + y 轴刻度。实线细线，绝不虚线 */
+function renderAxes(W, yMax, yScale, ticks) {
+  const { padL, padR, padT, h } = CHART;
+  const out = [];
+  for (let t = 0; t <= ticks; t++) {
+    const v = (yMax * t) / ticks;
+    const yy = yScale(v);
+    out.push(`<line class="grid-line" x1="${padL}" y1="${n1(yy)}" x2="${W - padR}" y2="${n1(yy)}"/>`);
+    out.push(`<text class="axis-text" x="${padL - 8}" y="${n1(yy + 4)}" text-anchor="end">${escapeHtml(compactNum(v))}</text>`);
+  }
+  out.push(`<line class="baseline" x1="${padL}" y1="${padT + h}" x2="${W - padR}" y2="${padT + h}"/>`);
+  return out.join("");
+}
+
+/** x 轴刻度：按可用宽度抽稀，避免文字互相压在一起 */
+function renderXLabels(W, buckets, xCenter) {
+  const { padL, padR, padT, h } = CHART;
+  const plotW = W - padL - padR;
+  const minGap = 56;                                  // 一个刻度连同间距要占的宽度
+  const maxLabels = Math.max(2, Math.floor(plotW / minGap));
+  const step = Math.ceil(buckets.length / maxLabels);
+
+  const idx = [];
+  for (let i = 0; i < buckets.length; i += step) idx.push(i);
+  // 末尾那个刻度总是想显示（读者最关心最新的数据），但只有跟上一个不打架时才加，
+  // 否则就是右边那对叠在一起的 "09-14 09-15"。
+  const last = buckets.length - 1;
+  if (idx[idx.length - 1] !== last && xCenter(last) - xCenter(idx[idx.length - 1]) >= minGap) {
+    idx.push(last);
+  }
+
+  return idx.map(i => {
+    const cx = xCenter(i);
+    // 最右一个刻度居中放会顶出画布，贴边改成右对齐
+    const edge = cx + 20 > W - padR;
+    const x = edge ? Math.min(cx, W - padR) : cx;
+    return `<text class="axis-text" x="${n1(x)}" y="${padT + h + 18}" ` +
+           `text-anchor="${edge ? "end" : "middle"}">${escapeHtml(shortBucket(buckets[i]))}</text>`;
+  }).join("");
+}
+
+function chartWidth() {
+  const body = document.getElementById("s_body");
+  return Math.max(320, Math.floor(body ? body.clientWidth : 640));
+}
+
+function renderStackedChart(data, visible) {
+  const W = chartWidth();
+  const { padL, padR, padT, padB, h, gap } = CHART;
+  const H = padT + h + padB;
+  const buckets = data.buckets;
+  const n = buckets.length;
+  const plotW = W - padL - padR;
+
+  const totals = buckets.map((_, i) => visible.reduce((a, s) => a + (s.values[i] || 0), 0));
+  const { yMax, step } = axisScale(Math.max(0, ...totals));
+  const yScale = v => padT + h - (v / yMax) * h;
+
+  const band = plotW / n;
+  const barW = Math.max(1, Math.min(24, band - 4));   // 柱子封顶 24px，余量是留白
+  // 第 i 根柱子占第 i 个 band 的中间，首尾两根都不会贴到画布边上
+  const xCenter = i => padL + plotW * (i + 0.5) / n;
+
+  const parts = [renderAxes(W, yMax, yScale, Math.round(yMax / step))];
+
+  for (let i = 0; i < n; i++) {
+    const segs = visible
+      .map(s => ({ key: s.key, v: s.values[i] || 0 }))
+      .filter(s => s.v > 0);
+    if (!segs.length) continue;
+
+    const x = xCenter(i) - barW / 2;
+    let acc = 0;
+    for (let k = 0; k < segs.length; k++) {
+      const v = segs[k].v;
+      const yBottom = yScale(acc);
+      const yTop = yScale(acc + v);
+      // 分段之间留 2px 表面色实缝：每段在自己上沿缩进 2px（最顶那段不缩，
+      // 这样整根柱子的总高度仍然是准的）。不用描边做分隔 —— 描边是额外的墨水。
+      const isTop = k === segs.length - 1;
+      const drawTop = isTop ? yTop : yTop + gap;
+      const drawH = yBottom - drawTop;
+      if (drawH > 0.5) {
+        parts.push(
+          `<path d="${barPath(n1(x), n1(drawTop), n1(barW), n1(drawH), isTop ? 4 : 0)}" fill="${seriesColor(segs[k].key)}"/>`
+        );
+      }
+      acc += v;
+    }
+
+    // 直接标注：只在够宽、且标签本身放得下时标柱顶合计（不是每根都标）
+    if (band >= 56 && totals[i] > 0) {
+      const ly = yScale(totals[i]) - 5;
+      if (ly > padT + 8) {
+        parts.push(
+          `<text class="cap-label" x="${n1(xCenter(i))}" y="${n1(ly)}" text-anchor="middle">${escapeHtml(compactNum(totals[i]))}</text>`
+        );
+      }
+    }
+  }
+
+  parts.push(renderXLabels(W, buckets, xCenter));
+
+  // 每天一个覆盖整条 band 的透明命中区：命中面积远大于色块本身，
+  // tabindex 让键盘用户也能逐天查看（与悬停等价）。
+  for (let i = 0; i < n; i++) {
+    parts.push(
+      `<rect class="bar-hit" data-i="${i}" data-cx="${n1(xCenter(i))}" tabindex="0" role="button" ` +
+      `aria-label="${escapeAttr(buckets[i])}" x="${n1(padL + band * i)}" y="${padT}" ` +
+      `width="${n1(band)}" height="${h}"/>`
+    );
+  }
+
+  return `<div class="chart-wrap">
+    <svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img"
+         aria-label="按${escapeAttr(data.bucket === "month" ? "月" : data.bucket === "week" ? "周" : "天")}分组的各模型用量堆叠柱状图">${parts.join("")}</svg>
+    <div class="chart-tip" id="s_tip"></div>
+  </div>`;
+}
+
+function renderLineChart(data, visible) {
+  const W = chartWidth();
+  const { padL, padR, padT, padB, h } = CHART;
+  const H = padT + h + padB;
+  const buckets = data.buckets;
+  const n = buckets.length;
+  const plotW = W - padL - padR;
+
+  let maxV = 0;
+  visible.forEach(s => s.values.forEach(v => { if (v > maxV) maxV = v; }));
+  const { yMax, step } = axisScale(maxV);
+  const yScale = v => padT + h - (v / yMax) * h;
+
+  const band = plotW / n;
+  const xCenter = i => padL + plotW * (i + 0.5) / n;
+
+  const parts = [renderAxes(W, yMax, yScale, Math.round(yMax / step))];
+
+  // 折线：2px，圆角圆头
+  visible.forEach(s => {
+    const pts = s.values.map((v, i) => `${n1(xCenter(i))},${n1(yScale(v || 0))}`).join(" ");
+    parts.push(
+      `<polyline points="${pts}" fill="none" stroke="${seriesColor(s.key)}" stroke-width="2" ` +
+      `stroke-linejoin="round" stroke-linecap="round"/>`
+    );
+  });
+
+  // 末点标记：>=8px，带 2px 表面色圆环，交叠时仍然读得出来
+  const ends = visible.map(s => ({ key: s.key, y: yScale(s.values[n - 1] || 0) }));
+  ends.forEach(e => {
+    parts.push(
+      `<circle cx="${n1(xCenter(n - 1))}" cy="${n1(e.y)}" r="4" fill="${seriesColor(e.key)}" ` +
+      `stroke="var(--panel)" stroke-width="2"/>`
+    );
+  });
+
+  // 末值直接标注：只在序列 <= 4 条、且标签彼此不打架时才标；否则交给图例 + tooltip
+  if (visible.length <= 4) {
+    const sorted = ends.slice().sort((a, b) => a.y - b.y);
+    let lastY = -Infinity;
+    const ok = new Set();
+    sorted.forEach(e => {
+      if (e.y - lastY >= 14 && e.y > padT + 6) { ok.add(e.key); lastY = e.y; }
+    });
+    ends.forEach(e => {
+      if (!ok.has(e.key)) return;
+      parts.push(
+        `<text class="axis-text" x="${n1(xCenter(n - 1) + 10)}" y="${n1(e.y + 4)}">${escapeHtml(compactNum(visible.find(s => s.key === e.key).values[n - 1] || 0))}</text>`
+      );
+    });
+  }
+
+  parts.push(renderXLabels(W, buckets, xCenter));
+
+  for (let i = 0; i < n; i++) {
+    parts.push(
+      `<rect class="bar-hit" data-i="${i}" data-cx="${n1(xCenter(i))}" tabindex="0" role="button" ` +
+      `aria-label="${escapeAttr(buckets[i])}" x="${n1(padL + band * i)}" y="${padT}" ` +
+      `width="${n1(band)}" height="${h}"/>`
+    );
+  }
+
+  return `<div class="chart-wrap">
+    <svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img"
+         aria-label="按${escapeAttr(data.bucket === "month" ? "月" : data.bucket === "week" ? "周" : "天")}分组的各模型用量折线图">${parts.join("")}</svg>
+    <div class="chart-tip" id="s_tip"></div>
+  </div>`;
+}
+
+function renderLegend(series) {
+  if (series.length < 2) return "";   // 单序列不需要图例，标题已经说明画的是什么
+  return `<div class="legend">` + series.map(s => {
+    const off = STATS_STATE.hidden.has(s.key);
+    const title = s.folded ? `包含: ${s.folded.join(", ")}` : "";
+    return `<div class="legend-item ${off ? "off" : ""}" data-key="${escapeAttr(s.key)}" title="${escapeAttr(title)}">
+      <span class="swatch" style="background:${seriesColor(s.key)}"></span>
+      <span>${escapeHtml(s.key)}</span>
+    </div>`;
+  }).join("") + `</div>`;
+}
+
+function bindChartEvents() {
+  const body = document.getElementById("s_body");
+  if (!body) return;
+
+  // 图例点击只切前端可见性，不重新请求
+  body.querySelectorAll(".legend-item").forEach(el => {
+    el.onclick = () => {
+      const key = el.dataset.key;
+      if (STATS_STATE.hidden.has(key)) STATS_STATE.hidden.delete(key);
+      else STATS_STATE.hidden.add(key);
+      renderStatsBody();
+    };
+  });
+
+  const tip = document.getElementById("s_tip");
+  if (!tip || !STATS_DATA) return;
+  const data = STATS_DATA;
+  // 与图上所画严格一致：用折叠后的序列，而不是接口原始列表
+  const visible = STATS_CHART_SERIES.filter(s => !STATS_STATE.hidden.has(s.key));
+
+  const show = i => {
+    const rows = visible
+      .map(s => ({ key: s.key, v: s.values[i] || 0 }))
+      .filter(r => r.v > 0)
+      .sort((a, b) => b.v - a.v);
+    const total = rows.reduce((a, r) => a + r.v, 0);
+    tip.innerHTML =
+      `<div class="tip-head">${escapeHtml(data.buckets[i])}</div>` +
+      (rows.length
+        ? rows.map(r => `<div class="tip-row">
+             <span class="swatch" style="background:${seriesColor(r.key)}"></span>
+             <span class="name">${escapeHtml(r.key)}</span>
+             <span class="val">${fullNum(r.v)}</span>
+           </div>`).join("")
+        : `<div class="tip-row">无数据</div>`) +
+      (rows.length > 1
+        ? `<div class="tip-row total"><span class="name">合计</span><span class="val">${fullNum(total)}</span></div>`
+        : "");
+    tip.style.display = "block";
+  };
+
+  body.querySelectorAll(".bar-hit").forEach(el => {
+    const i = Number(el.dataset.i);
+    const cx = Number(el.dataset.cx);
+    const place = () => {
+      show(i);
+      const w = tip.offsetWidth;
+      const wrapW = body.clientWidth;
+      let left = cx - w / 2;
+      left = Math.max(2, Math.min(left, wrapW - w - 2));
+      tip.style.left = left + "px";
+      tip.style.top = "8px";
+    };
+    el.addEventListener("mouseenter", place);
+    el.addEventListener("focus", place);
+    el.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+    el.addEventListener("blur", () => { tip.style.display = "none"; });
+  });
+}
+
+// ---------------------------------------------------------------------------
+//  保存
+// ---------------------------------------------------------------------------
+function bindSave() {
+  document.getElementById("saveAllBtn").onclick = async () => {
+    // 切到 global tab 确保 collectGlobal 能取到字段；否则需先渲染
+    if (ACTIVE_TAB !== "global" && ACTIVE_TAB !== "providers" && ACTIVE_TAB !== "routes" && ACTIVE_TAB !== "tenants") {
+      // stats tab 没有 config 字段，切回 global
+    }
+    // 收集各段：因为切 tab 会重渲染丢失输入，我们要求保存前先切回各 tab 收集？
+    // 简化：保存时基于 CONFIG 内存 + 当前 DOM 收集当前 tab；为避免丢失，要求用户在切换前
+    // 各 tab 的编辑已同步回 CONFIG。这里采用：每次切 tab 前先 collect 当前 tab 回写 CONFIG。
+    const payload = collectAllFromConfig();
+    try {
+      const r = await api(ENDPOINTS.config, { method: "PUT", body: payload });
+      toast("已保存并热重载");
+      // 重新拉取（api_key 重新脱敏）
+      await loadConfig();
+    } catch (e) {
+      let msg = e.message;
+      if (e.data && e.data.detail) {
+        msg = (e.data.detail.error || "") + (e.data.detail.detail ? "\n" + e.data.detail.detail : "");
+      }
+      toast("保存失败: " + msg.split("\n")[0], true);
+      showErrorBox(msg);
+    }
+  };
+}
+
+function showErrorBox(msg) {
+  let box = document.getElementById("globalErrorBox");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "globalErrorBox";
+    box.className = "error-box";
+    document.querySelector(".content").prepend(box);
+  }
+  box.textContent = msg;
+  box.style.display = "block";
+  setTimeout(() => { box.style.display = "none"; }, 8000);
+}
+
+// 切 tab 前把当前 tab 的输入写回 CONFIG，避免丢失
+function syncCurrentTabToConfig() {
+  if (!CONFIG) return;
+  try {
+    if (ACTIVE_TAB === "global") {
+      const g = collectGlobal();
+      Object.assign(CONFIG, g);
+    } else if (ACTIVE_TAB === "providers") {
+      CONFIG.providers = collectProviders();
+    } else if (ACTIVE_TAB === "routes") {
+      CONFIG.model_routes = collectRoutes();
+    } else if (ACTIVE_TAB === "tenants") {
+      CONFIG.tenants = collectTenants();
+    }
+  } catch (e) { /* 收集失败保留旧值 */ }
+}
+
+function collectAllFromConfig() {
+  // 确保当前 tab 已同步
+  syncCurrentTabToConfig();
+  // 深拷贝 CONFIG 作为 payload（仅 JSON 兼容类型）
+  return JSON.parse(JSON.stringify(CONFIG));
+}
+
+// ---------------------------------------------------------------------------
+//  事件绑定 & 工具
+// ---------------------------------------------------------------------------
+function bindTabEvents() {
+  bindProviderEvents();
+  bindRouteEvents();
+  bindTenantEvents();
+}
+
+function escapeHtml(s) {
+  if (s == null) return "";
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  })[c]);
+}
+function escapeAttr(s) { return escapeHtml(s); }
+
+// 重写 tab 切换以在切换前同步
+document.querySelectorAll(".tab[data-tab]").forEach(el => {
+  el.onclick = () => {
+    syncCurrentTabToConfig();
+    document.querySelectorAll(".tab[data-tab]").forEach(t => t.classList.remove("active"));
+    el.classList.add("active");
+    ACTIVE_TAB = el.dataset.tab;
+    renderTab();
+    // 清除残留错误框
+    const eb = document.getElementById("globalErrorBox");
+    if (eb) eb.remove();
+  };
+});
+
+document.getElementById("loginBtn").onclick = doLogin;
+document.getElementById("loginPass").addEventListener("keydown", e => { if (e.key==="Enter") doLogin(); });
+document.getElementById("logoutBtn").onclick = doLogout;
+
+// 启动
+bindSave();
+bootstrap();
+</script>
+</body>
+</html>

@@ -13,6 +13,40 @@ max_body_size = 15728640
 # 不声明时取下方 providers 数组的第一个。
 default_provider = "openai-only"
 
+# 用量库路径（SQLite）。默认 ./stats.db。
+# 库文件只增不减，所以配了下面的保留天数来定期清理。
+# stats_db = "./stats.db"
+
+# 统计数据保留天数（默认 30）。启动时清理一轮，之后每 24 小时清理一轮，
+# 删除 request_log 里 ts 早于「现在 - N 天」的记录；删除后若空闲页占比
+# 超过 20% 会自动 VACUUM 把空间还给文件系统。
+# 设为 0 或负数表示不清理，保留全部历史。
+stats_retention_days = 30
+
+# 落库时 prompt 字段的截断长度（字符，默认 2048）。0 或负数表示不存 prompt。
+# 管理界面只统计 token 用量，从不展示 prompt；而真实请求动辄几十上百 KB，
+# 原样入库会把库撑到几十 GB（实测 300KB/条 → 2000 条 600MB）。
+stats_prompt_max_chars = 2048
+
+# 用量落库策略：攒够 stats_batch_size 条、或等满 stats_flush_interval 秒就批量写一次。
+# 每请求单独 commit 会把写入路径变成吞吐瓶颈，攒批后 commit 次数降为 1/N。
+# 代价是「刚发生的请求」最多 stats_flush_interval 秒后才出现在统计里。
+stats_flush_interval = 0.5
+stats_batch_size = 500
+
+# config.toml 变更轮询间隔（秒，默认 2.0）。
+# uvicorn --workers N 下每个 worker 是独立进程，管理界面保存的配置只有处理该
+# 请求的那个 worker 会立即生效；其余 worker 靠轮询这个文件跟上，最迟
+# 一个间隔后全部生效。手改 config.toml 也走同一路径。
+config_watch_interval = 2.0
+
+# 每个 provider 的 HTTP 连接池上限（默认 max_connections=500，keepalive=100）。
+# httpx 默认只有 100，是网关的硬性并发天花板：第 101 个请求只能在池里排队，
+# 超过 timeouts.pool 直接 502。注意这是「每个 worker」的上限，实际总量还要乘 worker 数。
+pool_max_connections = 500
+pool_max_keepalive = 100
+pool_keepalive_expiry = 60.0
+
 
 # -----------------------------------------------------------------------------
 # 超时配置（秒）
@@ -31,10 +65,20 @@ pool    = 10.0
 # [providers.anthropic]）；存在哪个子表，就代表该 provider 原生支持该协议。
 #
 # 顶层字段：
-#   - id      : 必填，唯一标识
+#   - id      : 必填，唯一标识，且不能包含 '/'（用于 /v1/models 的
+#               provider_id/model_name 命名空间路由）
 #   - api_key : 可选；作为各协议子表的共享默认 key。
 #               大部分三方服务两个协议用同一个 Key，写在这里就够了；
 #               若个别协议需要单独 Key，在子表里再写 api_key 即可覆盖。
+#   - models  : 可选，字符串数组；手动指定该 provider 提供的模型列表。
+#               配置后不再请求上游 GET /models（适用于不提供该接口的上游，
+#               如火山方舟部分端点）；未配置时走 /models 自动发现。
+#
+# 示例（手动模型列表代替 /models 发现）：
+#   [[providers]]
+#   id      = "volcengine"
+#   api_key = "ark-xxx"
+#   models  = ["deepseek-v4-pro", "glm-5.3-flash", "minimax-m3"]
 #
 # 协议子表字段（[providers.openai] / [providers.anthropic]）：
 #   - base_url   : 必填，协议根路径（末尾 / 可省略）
@@ -151,5 +195,28 @@ auth_style = "bearer"
 [model_routes]
 "claude-3-5-sonnet-20241022" = { provider = "openai-only",   model = "gpt-4o" }
 "claude-3-5-haiku-20241022"  = { provider = "openai-only",   model = "gpt-4o-mini" }
-"deepseek-chat"              = { provider = "dual-protocol" }
+"deepseek-chat"              = { provider = "dual-shared-key" }
 "claude-native"              = { provider = "anthropic-only", model = "claude-3-5-sonnet-20241022" }
+
+
+# =============================================================================
+# 管理界面认证（[admin] 段）
+#
+# 配置后即可访问 Web 管理界面：http://<host>:8000/admin
+# 可在线编辑 config.toml 各段并热重载，无需重启服务。
+#
+# 二选一：
+#   - password       : 明文密码（仅开发期方便）
+#   - password_hash  : sha256(password) 的十六进制（生产推荐）
+# 两者都配置时优先校验 password_hash。
+#
+# 生成 password_hash（与租户 api_key 哈希同算法）：
+#   python -c "import hashlib;print(hashlib.sha256(b'your-password').hexdigest())"
+#
+# 不配置 [admin] 段时，管理界面写接口返回 503（避免无认证可写配置）。
+# =============================================================================
+[admin]
+username = "admin"
+password = "change-me"
+# password_hash = "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"   # sha256("password")
+

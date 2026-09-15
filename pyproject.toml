@@ -9,4 +9,14 @@ dependencies = [
     "httpx>=0.28.1",
     "pydantic>=2.12.5",
     "uvicorn>=0.40.0",
+    # 高并发网关的两个关键加速件：uvloop 换掉 asyncio 默认事件循环（SSE 长连接
+    # 下吞吐明显更好），httptools 换掉 h11 解析器。两者都是 CPython 扩展，且只支持
+    # POSIX —— Windows 上不加这两个 marker 会直接装不上。
+    "uvloop>=0.21.0; sys_platform != 'win32'",
+    "httptools>=0.6.4; sys_platform != 'win32'",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
 ]

@@ -74,6 +74,8 @@ cp config.example.toml config.toml   # 编辑你的真实配置
 | `log_level`        | string | `"INFO"`   | `"INFO"` 或 `"DEBUG"`；`"DEBUG"` 会打印上游每条 SSE 分片 JSON，流式时日志量很大                |
 | `max_body_size`    | int    | `15728640` | 请求体字节上限（约 15 MiB）                                                          |
 | `default_provider` | string | 第一个 provider 的 id | 未命中 `model_routes` 时使用的 provider id                                       |
+| `stats_db`         | string | `"./stats.db"` | 用量统计 SQLite 库路径                                                          |
+| `stats_retention_days` | int | `30`       | 统计数据保留天数；后台任务按此清理 `request_log`，`<=0` 表示不清理                                  |
 | `[timeouts]`       | table  | —          | httpx 连接超时（秒）：`connect` / `read` / `write` / `pool`                       |
 | `[[providers]]`    | array  | 至少一个       | 上游服务商列表，每项必须声明 `id` 与至少一个协议子表（`[providers.openai]` / `[providers.anthropic]`） |
 | `[model_routes]`   | table  | 可空         | 客户端模型名 → `{ provider, model }`（`model` 省略即透传客户端模型名）                       |
@@ -88,6 +90,8 @@ cp config.example.toml config.toml   # 编辑你的真实配置
 - `[[providers]]`：声明所有可用上游。顶层只放 `id` 与可选的**共享 `api_key`**；每个 provider 至少要有一个**协议子表**：
   - `[providers.openai]`    —— 该 provider 原生支持 OpenAI 协议
   - `[providers.anthropic]` —— 该 provider 原生支持 Anthropic Messages 协议
+
+- `models`（provider 顶层，可选）：手动指定该 provider 的模型列表（字符串数组）。配置后**代替上游 `GET /models` 自动发现**，适用于不提供 `/models` 接口的上游（如火山方舟部分端点）；`/v1/models` 聚合与管理界面下拉都会使用该列表（条目带 `models_source: "manual"` 标记）。`id` 不能包含 `/`。
 
   两个协议的 `base_url` 必须各自写在子表里（根路径天然不同）。注意两个协议的拼接约定不一样：
 

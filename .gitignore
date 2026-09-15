@@ -24,4 +24,5 @@ logs/
 
 **/*.db
 
-stats.db
+# 统计库本体、WAL/SHM 附属文件，以及跨进程认领清理用的锁文件
+stats.db*
