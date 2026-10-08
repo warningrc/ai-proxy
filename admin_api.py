@@ -5,7 +5,7 @@
   GET  /admin                → 单页 HTML 前端
   POST /admin/api/login      → 颁发 token
   POST /admin/api/logout     → 撤销 token
-  GET  /admin/api/config     → 当前配置 JSON（api_key 脱敏）
+  GET  /admin/api/config     → 当前配置 JSON（api_key 脱敏；租户除外，见下）
   PUT  /admin/api/config     → 全量配置 → 校验 + 写回 + 热重载
   GET  /admin/api/stats      → 用量统计（透传 usage_stats.query_stats）
   GET  /admin/api/stats/daily→ 时间 × 模型用量序列（透传 usage_stats.query_daily_usage）
@@ -13,6 +13,8 @@
 脱敏约定：GET 返回的 api_key 为掩码（_mask_key）。PUT 时若回传值仍是掩码
 （含 '***'），视为"未改动"，用当前 settings 中的真实值替换；否则视为用户新输入
 的明文，原样采用。这样明文 key 永不经过界面回显。
+
+**租户是唯一的例外**：tenants[].api_key 明文返回。理由见 _mask_config 里的注释。
 """
 
 from __future__ import annotations
@@ -79,8 +81,8 @@ def _resolve_masked_keys(incoming: Dict[str, Any]) -> Dict[str, Any]:
     """把回传配置中的掩码 api_key 还原为当前 settings 中的真实值。
 
     处理位置：providers 顶层共享 api_key、providers[].openai.api_key、
-    providers[].anthropic.api_key、tenants[].api_key、admin.password、
-    admin.password_hash。
+    providers[].anthropic.api_key、admin.password、admin.password_hash，
+    以及 tenants[].api_key（这个已经不脱敏了，还原分支只作为兜底，见下）。
 
     这里必须和 _mask_config 成对：只脱敏不还原的话，界面「不改就保存」会把掩码
     本身当新值写进 config.toml，凭据当场报废。
@@ -111,7 +113,12 @@ def _resolve_masked_keys(incoming: Dict[str, Any]) -> Dict[str, Any]:
                 else:
                     sub.pop("api_key", None)
 
-    # tenants
+    # tenants：GET 已经不脱敏了，正常回传的就是明文，这里不做事。
+    #
+    # 保留还原分支纯粹是兜底：升级前就已经打开的旧标签页内存里还留着掩码，用户从
+    # 那个页面点保存会把 "sk-abc***wxyz" 原样发过来 —— 不拦的话 config.toml 里的
+    # 真 key 就被这一串掩码覆盖，租户当场全部掉线。收到掩码只可能是「客户端没改
+    # 过它」，还原成当前值永远是对的。
     cur_tenants: Dict[str, Dict[str, Any]] = {
         t["id"]: t for t in current.get("tenants", [])
     }
@@ -153,9 +160,15 @@ def _mask_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(sub, dict) and "api_key" in sub:
                 sub["api_key"] = _mask_key(sub["api_key"])
 
-    for t in out.get("tenants", []):
-        if "api_key" in t:
-            t["api_key"] = _mask_key(t["api_key"])
+    # 租户 api_key 刻意**不脱敏**，明文返回。
+    #
+    # 和 provider 的 api_key 性质不同：provider key 是上游厂商的凭据（泄漏 = 别人
+    # 拿我们的账号刷上游），而租户 key 是**我们自己签发给客户的**凭据、由管理员在
+    # 这里录入并要发给对方。做成掩码（sk-abc***wxyz）意味着管理员再也取不回完整
+    # key，租户丢了 key 就只能换一把 —— 管理页对这项工作就没用了。
+    #
+    # 代价是明文 key 会出现在界面和响应体里，接受这一点：config.toml 本来就是
+    # 明文存的，admin 页也只在认证后可见（require_admin）。
 
     admin = out.get("admin")
     if isinstance(admin, dict):
